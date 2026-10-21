@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -48,7 +49,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>v2 · Style and aspect search</title>
+<title>Refseek Browser</title>
 <style>
   :root {
     color-scheme: dark;
@@ -232,7 +233,7 @@ PAGE = r"""<!doctype html>
 <body>
 <header>
   <div class="wrap">
-    <h1>Semantic search <span class="lab">v2</span></h1>
+    <h1>Refseek <span class="lab">Browser · 2.0.1</span></h1>
     <div class="sub" id="sub">loading index…</div>
     <details class="tools"><summary>Tools & reports</summary>
       <a href="/match">Picture ↔ text match</a><a href="/focus">Compare image aspects</a>
@@ -2241,6 +2242,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"removed": removed, "total": len(keep_r), "roots": index.roots})
 
 
+class _LocalHTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR can allow two apps to listen on one port.
+    # A successful bind must mean our launch URL reaches our own library.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def build_server(settings: Settings, client: EmbedClient, port: int | None = None):
     from .folder_store import migrate
     migrate(settings.data_dir)
@@ -2250,7 +2262,7 @@ def build_server(settings: Settings, client: EmbedClient, port: int | None = Non
     handler._cache = {"stamp": None, "index": None, "paths": set()}
     handler.focus_engine = FocusEngine(settings, client)
     bind_port = settings.web_port if port is None else port
-    server = ThreadingHTTPServer((settings.web_host, bind_port), handler)
+    server = _LocalHTTPServer((settings.web_host, bind_port), handler)
     server.daemon_threads = True
     from .store import CorruptIndexError
 

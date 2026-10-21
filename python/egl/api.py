@@ -154,6 +154,22 @@ CONTENT_TYPES = {"image": "image_url", "audio": "input_audio", "video": "input_v
 
 
 def media_item(raw: bytes, mime: str, kind: str = "image") -> dict:
+    if kind == "image":
+        # The bundled server cannot decode WebP without ffmpeg. Lossless PNG
+        # transport preserves the already-prepared pixels and resize behavior.
+        # Inspect bytes because an image can have the wrong filename extension.
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(raw)) as image:
+                output = io.BytesIO()
+                image.save(output, "PNG")
+                raw = output.getvalue()
+            mime = "image/png"
+        elif raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif raw.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
     b64 = base64.b64encode(raw).decode("ascii")
     return content_item(f"data:{mime};base64,{b64}", kind)
 

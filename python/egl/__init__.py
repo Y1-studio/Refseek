@@ -6,5 +6,5 @@ from .search import Searcher
 from .store import Index
 from .webui import serve
 
-__version__ = "2.0"
+__version__ = "2.0.1"
 __all__ = ["Settings", "Indexer", "Searcher", "Index", "serve"]

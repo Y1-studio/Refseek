@@ -14,12 +14,12 @@ controls when you need them.
 
 ## 1. Open The App
 
-The program is called SemanticSearch-Native.exe.
+The program is called Refseek-Desktop.exe.
 
 An ".exe" file is a Windows application: double-click it (two quick clicks)
 to open the program.
 Windows may hide the ".exe" ending, so you might see just
-"SemanticSearch-Native".
+"Refseek-Desktop".
 
 If you received a ZIP file, extract it first: right-click the ZIP, choose
 "Extract All", and open the folder Windows creates.
@@ -373,7 +373,7 @@ search catalogue, settings and the working files the app needs.
 Keep that data folder. If you move or back up the app, copy its whole folder,
 including data. Your original image folders also need to remain available.
 
-When receiving an updated SemanticSearch-Native.exe:
+When receiving an updated Refseek-Desktop.exe:
 1) Close the running app and let it finish closing.
 2) Replace the old application file in the same folder.
 3) Keep the existing data folder.

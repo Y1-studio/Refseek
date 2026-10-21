@@ -17,7 +17,7 @@ Toolchains must already be available. The supplied scripts do not install system
 Large resources and artwork fixtures are not included in Git. The application requires the exact models, runtime files, frozen style adapters and compatibility probes. Recover these from the matching downloadable EXE:
 
 ```powershell
-python tooling/prepare-assets.py --from-exe "C:\Downloads\SemanticSearch-Native.exe"
+python tooling/prepare-assets.py --from-exe "C:\Downloads\Refseek-Desktop.exe"
 ```
 
 Alternatively, use an existing matching assets folder:
@@ -67,7 +67,7 @@ For a different Python command or full interpreter path, use `-Python`:
 .\build.ps1 -Package -Python "C:\Tools\Python312\python.exe"
 ```
 
-`tooling/package.py` appends the verified resource bundle to the native executable and writes `SemanticSearch-Native.exe` plus `build-manifest.json` in the `native/` folder. Keep the recovered notices with the resources; the packager also collects available Rust dependency licenses from the local registry.
+`tooling/package.py` appends the verified resource bundle to the native executable and writes `Refseek-Desktop.exe` plus `build-manifest.json` in the `native/` folder. Keep the recovered notices with the resources; the packager also collects available Rust dependency licenses from the local registry.
 
 The portable EXE extracts resources next to itself on first opening and reuses them on later launches. Its processing fallback is CUDA, then Vulkan, then CPU; real text/image compatibility probes must pass before a device is accepted. Only the app's own inference process is stopped when it closes.
 
@@ -76,9 +76,9 @@ The portable EXE extracts resources next to itself on first opening and reuses t
 This snapshot has manual real-model diagnostics rather than an automated test/CI suite. With the portable EXE:
 
 ```powershell
-.\SemanticSearch-Native.exe --verify-math
-.\SemanticSearch-Native.exe --smoke --image-input-check
-.\SemanticSearch-Native.exe --gui-smoke --interaction-smoke --image-input-check
+.\Refseek-Desktop.exe --verify-math
+.\Refseek-Desktop.exe --smoke --image-input-check
+.\Refseek-Desktop.exe --gui-smoke --interaction-smoke --image-input-check
 ```
 
 Use a separate writable `--home` directory and explicit `--assets` when running diagnostics alongside another instance. Diagnostics use a separate `verification/` library. They check adapter arithmetic, image transport, indexing, drag/drop, concurrent search, layout and viewer navigation. `--storage-check` adds snapshot/reuse/cancellation checks.

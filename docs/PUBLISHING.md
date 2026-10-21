@@ -6,10 +6,10 @@ Create a repository named **Refseek**. Upload the contents of the prepared Refse
 
 ## Release downloads
 
-Create tag **v2.0.0**, title **Refseek 2.0 — Desktop and Browser**. Use the prepared RELEASE_NOTES.md as the description. Attach these four files from the sibling github-release folder:
+Create tag **v2.0.1**, title **Refseek 2.0.1 — Desktop and Browser**. Use the prepared RELEASE_NOTES.md as the description. Attach these four files from the sibling github-release folder:
 
-- SemanticSearch-Native.exe
-- SemanticSearch-v2.exe
+- Refseek-Desktop.exe
+- Refseek-Browser.exe
 - README.txt
 - SHA256SUMS.txt
 

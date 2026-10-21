@@ -1,6 +1,6 @@
 # Browser edition: getting started
 
-1. Download **SemanticSearch-v2.exe** from Releases and put it in a folder of its own.
+1. Download **Refseek-Browser.exe** from Releases and put it in a folder of its own.
 2. Double-click it. A small launcher window prepares the model and opens a search page in your usual browser. Keep that launcher open.
 3. Open **Library & indexing**, choose a folder of pictures and start indexing. Indexing prepares a searchable catalogue; your original pictures stay in place.
 4. Return to **Search**. Enter a description, choose or drop in a reference picture, or use both. Choose the aspect you want to match, such as **Style** or **Subject**.
@@ -11,7 +11,7 @@
 
 ## Keep your saved catalogue
 
-The folder **SemanticSearch-v2-data** beside the application holds your catalogue and logs. Keep it during updates, and keep your original picture folders available. After changing a picture folder, update its index. Keep the Python and Rust applications in separate folders; their settings and catalogues are independent.
+The folder **Refseek-Browser-data** beside the application holds your catalogue and logs. If you already have **SemanticSearch-v2-data** and no new data folder, the renamed app continues to use your existing folder. Keep it during updates, and keep your original picture folders available. After changing a picture folder, update its index. Keep the Python and Rust applications in separate folders; their settings and catalogues are independent.
 
 ## If something goes wrong
 

@@ -5,7 +5,7 @@ This source folder includes the pinned public model/runtime manifest. The actual
 From the `native/` folder:
 
 ```powershell
-python tooling/prepare-assets.py --from-exe "C:\Downloads\SemanticSearch-Native.exe"
+python tooling/prepare-assets.py --from-exe "C:\Downloads\Refseek-Desktop.exe"
 ```
 
 Alternatively:

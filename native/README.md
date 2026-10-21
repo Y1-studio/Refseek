@@ -1,4 +1,4 @@
-# Semantic Search Native
+# Refseek Desktop
 
 **Find the reference image you remember, even when you cannot remember its filename.**
 
@@ -13,7 +13,7 @@ Search runs on your computer in a native Rust window. The downloadable app inclu
 ## Download and open
 
 1. Open **Releases** on this repository's page.
-2. Download **`SemanticSearch-Native.exe`** from the release's **Assets** section. The automatically generated “Source code” downloads are for developers.
+2. Download **`Refseek-Desktop.exe`** from the release's **Assets** section. The automatically generated “Source code” downloads are for developers.
 3. Put the application in its own folder, such as `Documents\Art Search`.
 4. Double-click it and wait for the opening/model-loading messages to finish.
 

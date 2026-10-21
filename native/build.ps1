@@ -15,7 +15,7 @@ try {
         }
     }
     if (-not $MinGwBin -or -not (Test-Path -LiteralPath (Join-Path $MinGwBin 'gcc.exe'))) {
-        throw 'MinGW-w64 GCC is required. Run with -MinGwBin pointing to its bin folder. See docs/BUILDING.md.'
+        throw 'MinGW-w64 GCC is required. Run with -MinGwBin pointing to its bin folder. See ../docs/NATIVE_BUILDING.md.'
     }
     $env:CARGO_HOME = Join-Path $PSScriptRoot '.cargo'
     $env:CARGO_TARGET_DIR = Join-Path $PSScriptRoot 'target'

@@ -1,6 +1,7 @@
 # Local libraries, build output, logs and credentials
 **/data/
 **/SemanticSearch-v2-data/
+**/Refseek-Browser-data/
 **/verification/
 **/target/
 **/build-work/

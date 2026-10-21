@@ -2,7 +2,7 @@
 
 **Find pictures in your own art and reference folders using words, an example image, or both.**
 
-Refseek offers two Windows apps. The current 2.0 windows and executable filenames still use the earlier Semantic Search name. Both include the model and processing tools, run searches locally, and support similarity, subject, style, pose, viewpoint, composition, colour and lighting searches.
+Refseek offers two Windows apps. Both include the model and processing tools, run searches locally, and support similarity, subject, style, pose, viewpoint, composition, colour and lighting searches.
 
 ## Download: choose your interface
 
@@ -10,8 +10,8 @@ Open **[the latest release](https://github.com/Y1-studio/Refseek/releases/latest
 
 | Download | Choose it when… |
 | --- | --- |
-| **[SemanticSearch-Native.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/SemanticSearch-Native.exe)** — recommended | You want a desktop app with its own window, display settings and indexing progress. Built with Rust; no browser needed. |
-| **[SemanticSearch-v2.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/SemanticSearch-v2.exe)** | You prefer the Python edition's browser interface. It opens a local page in your default browser; keep its launcher window open. |
+| **[Refseek-Desktop.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Desktop.exe)** — recommended | You want a desktop app with its own window, display settings and indexing progress. Built with Rust; no browser needed. |
+| **[Refseek-Browser.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Browser.exe)** | You prefer the Python edition's browser interface. It opens a local page in your default browser; keep its launcher window open. |
 
 An **.exe** is a Windows application. Neither download needs a separate Python or Rust installation, model download, or separately started model server. The automatic **Source code** downloads are for developers.
 

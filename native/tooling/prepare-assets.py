@@ -34,7 +34,7 @@ def safe_target(name):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--from-exe', type=Path, help='A matching SemanticSearch-Native.exe release')
+    group.add_argument('--from-exe', type=Path, help='A matching Refseek-Desktop.exe release')
     group.add_argument('--from-directory', type=Path, help='An existing assets folder')
     parser.add_argument('--verify-only', action='store_true', help='Verify source resources without copying them')
     args = parser.parse_args()

@@ -42,8 +42,8 @@ def main():
         if manifest.get('assets/' + name) != record['sha256']:
             raise RuntimeError(f'Pinned asset hash mismatch: {name}')
     binary = ROOT / 'target/x86_64-pc-windows-gnu/release/semantic-search-native.exe'
-    output = ROOT / 'SemanticSearch-Native.exe'
-    temp = ROOT / 'SemanticSearch-Native.building.exe'
+    output = ROOT / 'Refseek-Desktop.exe'
+    temp = ROOT / 'Refseek-Desktop.building.exe'
     shutil.copyfile(binary, temp)
     with zipfile.ZipFile(temp, 'a', compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True, strict_timestamps=False) as z:
         z.writestr('bundle-manifest.json', json.dumps(manifest, sort_keys=True))

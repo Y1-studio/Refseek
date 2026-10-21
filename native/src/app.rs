@@ -435,7 +435,7 @@ impl App {
                     self.assets = Some(a);
                     self.ready = true;
                     self.busy = false;
-                    self.status = "Ready · native library is independent from v2".into();
+                    self.status = "Ready".into();
                 }
                 Event::Roots(r) => self.roots = r,
                 Event::Hits(h) => {
@@ -1190,7 +1190,7 @@ impl App {
                     });
                     ui.add(
                         egui::Label::new(
-                            RichText::new(format!("{}", self.o.data.join(&r.snapshot).display()))
+                            RichText::new(display_path(&self.o.data.join(&r.snapshot)))
                                 .small(),
                         )
                         .truncate(),
@@ -1253,7 +1253,7 @@ impl App {
         ui.add_space(18.);
         ui.label(RichText::new("Everything stays beside the application").strong());
         ui.monospace(display_path(&self.o.home));
-        ui.label(format!("Native library: {}", self.o.data.display()));
+        ui.label(format!("Native library: {}", display_path(&self.o.data)));
         ui.horizontal_wrapped(|ui| {
             if ui.button("Show native data").clicked() {
                 platform::reveal(&self.o.home.join("data"), false);
@@ -1778,7 +1778,7 @@ impl eframe::App for App {
             .resizable(false)
             .show_inside(ui, |ui| {
                 ui.add_space(18.);
-                ui.heading("Semantic Search");
+                ui.heading("Refseek");
                 ui.label(
                     RichText::new("RUST DESKTOP")
                         .small()
@@ -1834,7 +1834,7 @@ impl eframe::App for App {
                 if !self.ready && !self.stopped && !self.closing.load(Ordering::Relaxed) {
                     egui::ScrollArea::vertical().id_salt("opening-page").show(ui, |ui| {
                         ui.add_space(20.);
-                        ui.heading("Opening Semantic Search…");
+                        ui.heading("Opening Refseek…");
                         ui.add_space(12.);
                         ui.spinner();
                         ui.label(&self.status);
@@ -1930,7 +1930,7 @@ pub fn run(o: Options, opening: Option<crate::opening::Opening>) -> Res<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Semantic Search · Rust desktop",
+        "Refseek Desktop",
         opts,
         Box::new(move |cc| Ok(Box::new(App::new(cc, o, opening)))),
     )

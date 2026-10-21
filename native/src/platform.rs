@@ -122,7 +122,7 @@ pub fn message(s: &str) {
         MessageBoxW(
             None,
             PCWSTR(wide(std::ffi::OsStr::new(s)).as_ptr()),
-            windows::core::w!("Semantic Search · Rust"),
+            windows::core::w!("Refseek Desktop"),
             MB_OK | MB_ICONERROR,
         );
     }

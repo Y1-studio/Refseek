@@ -1,6 +1,6 @@
-SEMANTIC SEARCH v2 — Windows x64 portable application
+REFSEEK BROWSER 2.0.1 — Windows x64 portable application
 
-Double-click SemanticSearch-v2.exe. Python and a separate model server are not
+Double-click Refseek-Browser.exe. Python and a separate model server are not
 needed. Everything runs locally. The launcher opens the search page in your
 default browser. Keep the launcher open; Stop and exit saves completed indexing
 work and stops its own model server.
@@ -19,8 +19,9 @@ The single EXE extracts its bundled files into a temporary directory on launch;
 allow several GB of free space. First GPU startup can take longer for shader or
 kernel preparation. The EXE is unsigned. No installer is required.
 
-Your indexes, folder catalog and logs are stored in SemanticSearch-v2-data beside
-the EXE. Put it in a writable folder. Copy that data folder too when moving your
+New libraries are stored in Refseek-Browser-data beside the EXE. If you already
+have SemanticSearch-v2-data there, the app reuses it when the new folder does not
+exist. Your previous library is not renamed or overwritten. Put it in a writable folder. Copy that data folder too when moving your
 library. Original images stay where they are; moving them requires a rescan.
 Open Library & indexing to select folders. Each scanned folder has its own index
 and vectors. v1.9 and its library are left intact. v2 starts with a fresh library
@@ -40,11 +41,11 @@ Subject, pose, composition, viewpoint, color and lighting use current-model
 calibration. Pose remains embedding-based, without a joint detector.
 
 Useful command-line overrides:
-  SemanticSearch-v2.exe --backend cpu
-  SemanticSearch-v2.exe --backend vulkan
-  SemanticSearch-v2.exe --backend cuda --device CUDA1
-  SemanticSearch-v2.exe --data-dir "D:\SearchData"
-  SemanticSearch-v2.exe --diagnose --backend auto
+  Refseek-Browser.exe --backend cpu
+  Refseek-Browser.exe --backend vulkan
+  Refseek-Browser.exe --backend cuda --device CUDA1
+  Refseek-Browser.exe --data-dir "D:\SearchData"
+  Refseek-Browser.exe --diagnose --backend auto
 Diagnostics write diagnostics.json beside the indexes and exit. Backend logs
 explain failed candidates. The model server and GUI bind only to 127.0.0.1.
 

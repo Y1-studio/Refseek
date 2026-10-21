@@ -7,5 +7,5 @@ try {
     $env:PYINSTALLER_CONFIG_DIR = Join-Path $PSScriptRoot 'build-work/pyinstaller-cache'
     & $Python -m PyInstaller --noconfirm --workpath build-work/pyinstaller --distpath dist SemanticSearch-v2.spec
     if ($LASTEXITCODE -ne 0) { throw 'EXE build failed.' }
-    Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'dist/SemanticSearch-v2.exe') -Algorithm SHA256 | Format-List
+    Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'dist/Refseek-Browser.exe') -Algorithm SHA256 | Format-List
 } finally { Pop-Location }

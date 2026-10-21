@@ -118,6 +118,9 @@ class Runtime:
                         raise RuntimeError('Invalid '+label+' embedding')
                     expected = np.load(ROOT/'style-models'/('probe-'+label+'.npy'), allow_pickle=False)
                     scores[label] = float(vec@expected/(np.linalg.norm(vec)*np.linalg.norm(expected)))
+                    if not np.isfinite(scores[label]) or scores[label] < .9995:
+                        raise RuntimeError(f'Bundled model compatibility check failed for {label}: '
+                                           f'cosine {scores[label]:.6f}, requires 0.9995')
                 self.info = dict(backend=kind, device=dev, device_name=name, llama_release='b11741',
                                  model='EmbeddingGemma 2 Q8_0', api_url=url+'/v1',
                                  bf16_probe_cosines=scores, attempts=self.attempts, log=str(logpath))

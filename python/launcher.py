@@ -4,8 +4,16 @@ import argparse, atexit, json, os, queue, sys, threading, time, traceback, webbr
 from pathlib import Path
 from runtime import Runtime, ROOT, free_port
 
+def default_data_dir(home):
+    """A renamed application must still find an existing portable library."""
+    home = Path(home)
+    current = home/'Refseek-Browser-data'
+    legacy = home/'SemanticSearch-v2-data'
+    return legacy if legacy.exists() and not current.exists() else current
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Semantic Search v2')
+    parser = argparse.ArgumentParser(description='Refseek Browser 2.0.1')
     parser.add_argument('--backend', choices=['auto','cuda','vulkan','cpu'], default='auto')
     parser.add_argument('--device', help='Optional llama.cpp device, e.g. CUDA1 or Vulkan0')
     parser.add_argument('--data-dir', type=Path)
@@ -14,7 +22,7 @@ def main():
     parser.add_argument('--diagnostic-output', type=Path)
     args = parser.parse_args()
     home = Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else ROOT
-    data = (args.data_dir or home/'SemanticSearch-v2-data').resolve()
+    data = (args.data_dir or default_data_dir(home)).resolve()
     data.mkdir(parents=True, exist_ok=True)
     # Windowed builds have no console; index progress still needs a writable stream.
     stream = (data/'application.log').open('a',encoding='utf-8',buffering=1)
@@ -50,12 +58,18 @@ def main():
         return 0
     import tkinter as tk
     from tkinter import ttk
-    root = tk.Tk(); root.title('Semantic Search v2'); root.geometry('660x310'); root.minsize(600,300)
+    if os.name == 'nt':
+        import ctypes
+        app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        app_id.argtypes = [ctypes.c_wchar_p]
+        app_id.restype = ctypes.c_long
+        app_id('Y1-studio.Refseek.Browser')
+    root = tk.Tk(); root.title('Refseek Browser'); root.geometry('660x310'); root.minsize(600,300)
     root.configure(bg='#10151c')
     style=ttk.Style(); style.theme_use('clam')
     style.configure('TFrame',background='#10151c');style.configure('TLabel',background='#10151c',foreground='#dce6f4')
     frame=ttk.Frame(root,padding=24);frame.pack(fill='both',expand=True)
-    ttk.Label(frame,text='Semantic Search v2',font=('Segoe UI',20,'bold')).pack(anchor='w')
+    ttk.Label(frame,text='Refseek Browser',font=('Segoe UI',20,'bold')).pack(anchor='w')
     ttk.Label(frame,text='EmbeddingGemma 2 Q8_0 · local search',font=('Segoe UI',11)).pack(anchor='w',pady=(4,16))
     status=tk.StringVar(value='Detecting graphics devices…')
     ttk.Label(frame,textvariable=status,wraplength=600).pack(anchor='w')

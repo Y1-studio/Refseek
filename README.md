@@ -1,66 +1,60 @@
 # Refseek
 
-**Find pictures in your own art and reference folders using words, an example image, or both.**
+Search your own art and reference folders with a description, an example image, or both. Refseek returns pictures from the folders you add. Searches run on your computer.
 
-Refseek offers two Windows apps. Both include the model and processing tools, run searches locally, and support similarity, subject, style, pose, viewpoint, composition, colour and lighting searches.
+## Download for Windows
 
-## Download: choose your interface
+Choose an app from the [latest release](https://github.com/Y1-studio/Refseek/releases/latest). Both downloads include the model. You don't need to install Python, Rust, or a separate model server.
 
-Open **[the latest release](https://github.com/Y1-studio/Refseek/releases/latest)** and expand **Assets**. Download one of these application files:
-
-| Download | Choose it when… |
+| Download | Interface |
 | --- | --- |
-| **[Refseek-Desktop.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Desktop.exe)** — recommended | You want a desktop app with its own window, display settings and indexing progress. Built with Rust; no browser needed. |
-| **[Refseek-Browser.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Browser.exe)** | You prefer the Python edition's browser interface. It opens a local page in your default browser; keep its launcher window open. |
+| [Refseek-Desktop.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Desktop.exe) | Desktop window with display scaling, text size and layout settings. Built with Rust. |
+| [Refseek-Browser.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Browser.exe) | Search page in your usual browser. Built with Python; keep its launcher window open while using it. |
 
-An **.exe** is a Windows application. Neither download needs a separate Python or Rust installation, model download, or separately started model server. The automatic **Source code** downloads are for developers.
+An `.exe` is a Windows application file. Download the app you want, put it in its own folder, and double-click it. The **Source code** downloads are for building the app yourself.
 
-Put the app in its own writable folder, double-click it, wait for model loading, then add a folder of pictures in Library and start indexing. Indexing creates the searchable catalogue; it leaves the original pictures where they are. Allow several gigabytes of free disk space for included resources. Graphics drivers must already be installed. The apps try compatible NVIDIA CUDA devices, then Vulkan graphics, then CPU.
+Leave several gigabytes of disk space for the included resources. Loading takes time, particularly on the first launch. Refseek tries compatible NVIDIA CUDA devices, then Vulkan graphics, then CPU. It uses the graphics drivers already on your computer.
 
-If you download both editions, give each its own folder. Their catalogues and settings are separate. They can search the same original picture folders.
+## Start searching
 
-## See the desktop app
+1. Open **Library** in the desktop app, or **Library & indexing** in the browser app.
+2. Add a folder of pictures and start indexing. This creates a searchable catalogue without moving your originals.
+3. Open **Search**. Describe a picture, choose a reference image, or use both.
+4. Click **Search library** on desktop or **Search** in the browser, then click a result to open its preview.
 
-[![Native desktop search with a reference image and words](docs/screenshots/search.png)](docs/screenshots/search.png)
+With a reference image, choose what to match: **Similarity**, **Subject**, **Style**, **Pose**, **Viewpoint**, **Composition**, **Color**, or **Lighting**. For example, Style asks for pictures drawn or painted like the reference, including pictures of different subjects.
 
-*Actual Rust app screenshot using original demo illustrations. Click for full size. The browser edition has a different layout.*
+Style starts with the **Contrastive style adapter**. Style and pose matches are approximate; the subject and background still influence the results. Pose matching uses image embeddings, without a joint detector. The style adapters were fitted on 12,940 images from 84 artists, but the full-data exports and their transfer to the bundled Q8 model still need evaluation on new collections.
+
+Use **+ Want** for more descriptions. Add a negative image to push similar results down, exclude concepts, or limit the folders searched. You can search saved work while indexing continues. In the preview, arrow keys move between pictures without resizing the window.
+
+## Desktop screenshots
+
+[![Desktop search with a reference image and description](docs/screenshots/search.png)](docs/screenshots/search.png)
 
 | Refine and negative images | Library and indexing |
 | --- | --- |
-| [![Refine and negative-image controls](docs/screenshots/refine.png)](docs/screenshots/refine.png) | [![Library with live indexing speed](docs/screenshots/library.png)](docs/screenshots/library.png) |
+| [![Refine controls](docs/screenshots/refine.png)](docs/screenshots/refine.png) | [![Indexing progress and speed](docs/screenshots/library.png)](docs/screenshots/library.png) |
 
-| Display settings | Image viewer |
+| Display settings | Image preview |
 | --- | --- |
-| [![Scaling and appearance settings](docs/screenshots/settings.png)](docs/screenshots/settings.png) | [![Fixed-frame image viewer](docs/screenshots/viewer.png)](docs/screenshots/viewer.png) |
+| [![Scale, text size and layout settings](docs/screenshots/settings.png)](docs/screenshots/settings.png) | [![Image preview with Previous and Next controls](docs/screenshots/viewer.png)](docs/screenshots/viewer.png) |
 
-## Search controls
+Click an image for full size. These captures show the Rust app with [demo illustrations](docs/screenshots/README.md). The browser app has a different layout.
 
-- Search with text, a whole image, or a blend of both. Choose the aspect you want to match.
-- Style starts with the frozen **Contrastive style adapter**; the Current style adapter is also available.
-- Add multiple Want descriptions and refine with exclusions or a negative example image.
-- Keep folder indexes separate, reuse unchanged files and search saved results while indexing continues.
-- Browse results with arrow keys in a stable image preview.
+## Updates and saved libraries
 
-Style and pose matches remain approximate. Pose uses embedding projections, without a joint detector. The style adapters were fitted on 12,940 images across 84 artists. Earlier evaluation scores do not establish retrieval accuracy for the full-data exports or their Q8 transfer on new collections.
+Close the old app, put the new EXE in the same folder, and keep the existing data folder. Update shortcuts if the EXE's name has changed.
+
+The desktop app saves its catalogue and settings in `data` beside the EXE. The browser app uses `Refseek-Browser-data`; it reuses `SemanticSearch-v2-data` when that older folder exists and the new folder doesn't. Keep the two editions in separate application folders. Their catalogues are independent, even when they search the same pictures.
 
 ## Guides and source
 
-| Edition | User guide | Source and build instructions |
+| Edition | Using the app | Building it |
 | --- | --- | --- |
-| Rust desktop | [Artist's guide with screenshots](docs/USER_GUIDE.md) | [native/](native/README.md) · [Build guide](docs/NATIVE_BUILDING.md) |
-| Python/browser | [Browser guide](docs/PYTHON_GUIDE.md) | [python/](python/README.md) |
+| Desktop | [Artist's guide](docs/USER_GUIDE.md) | [Rust source](native/README.md) and [build instructions](docs/NATIVE_BUILDING.md) |
+| Browser | [Browser guide](docs/PYTHON_GUIDE.md) | [Python source and build instructions](python/README.md) |
 
-Source layout:
+`native/` and `python/` contain the application code. `docs/` contains guides and screenshots. Model weights, runtime binaries and trained adapter files are recovered from a matching release when building; they aren't stored in Git. The downloads are Windows x64 apps. This release has no Linux AppImage.
 
-```text
-Refseek/
-├── README.md
-├── native/
-├── python/
-├── docs/
-└── THIRD_PARTY_NOTICES.md
-```
-
-Large binaries, model weights, frozen adapters, research images, dependency caches and personal libraries are excluded from Git. Builders recover exact application resources from a matching release; each edition documents how. This snapshot provides Windows x64 downloads; no Linux AppImage is included.
-
-See [third-party notices](THIRD_PARTY_NOTICES.md) and the [publishing guide](docs/PUBLISHING.md). No project-wide source license has been selected. Third-party components keep their own terms.
+See the [third-party notices](THIRD_PARTY_NOTICES.md) and [publishing instructions](docs/PUBLISHING.md). No project-wide source license has been selected. Third-party components retain their own terms.

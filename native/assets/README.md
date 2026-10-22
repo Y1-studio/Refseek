@@ -1,19 +1,19 @@
 # Application resources
 
-This source folder includes the pinned public model/runtime manifest. The actual models, runtime binaries, frozen style adapters, compatibility probes and diagnostic images are recovered from a matching native release or existing assets folder.
+Git stores `assets-manifest.json` here. Recover the model, runtime binaries, trained style adapters, probes and diagnostic images from a matching desktop release or assets folder.
 
-From the `native/` folder:
+From `native/`:
 
 ```powershell
 python tooling/prepare-assets.py --from-exe "C:\Downloads\Refseek-Desktop.exe"
 ```
 
-Alternatively:
+Or recover from a folder:
 
 ```powershell
 python tooling/prepare-assets.py --from-directory "C:\ArtSearchBuild\assets"
 ```
 
-The recovery checks every resource against `resource-lock.json` and keeps all resources inside this project's `assets/` directory. Add `--verify-only` to validate the source without copying files.
+The script checks every resource against `resource-lock.json` and copies it under `assets/`. Recovered files are ignored by Git. Add `--verify-only` to check the source without copying it.
 
-Only this README and `assets-manifest.json` are tracked here. Recovered resources are ignored by Git. See [the build guide](../../docs/NATIVE_BUILDING.md) for full instructions.
+See the [native build instructions](../../docs/NATIVE_BUILDING.md) for requirements, compilation and packaging.

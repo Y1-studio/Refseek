@@ -1,56 +1,70 @@
-REFSEEK BROWSER 2.0.1 — Windows x64 portable application
+REFSEEK BROWSER 2.0.1
+Windows x64 runtime notes
 
-Double-click Refseek-Browser.exe. Python and a separate model server are not
-needed. Everything runs locally. The launcher opens the search page in your
-default browser. Keep the launcher open; Stop and exit saves completed indexing
-work and stops its own model server.
-In an image preview, Left/Up and Right/Down move between images, including
-across result pages. The viewer keeps a fixed frame; image proportions do not
-resize it or scroll the background page. Esc closes the preview.
+For setup and search controls, read docs/PYTHON_GUIDE.md in the repository.
+The source build instructions are in python/README.md. The ready-made EXE
+includes Python, the model and its runtime files.
 
-Automatic selection: NVIDIA CUDA, then Vulkan graphics, then CPU. Each candidate
-must load the model and return valid text AND image embeddings before it is used.
-The exact pinned b11741 CUDA 12.4 build, its CUDA runtime, matching Vulkan/CPU
-builds, and the requested Unsloth Q8_0 model/projector are bundled.
-Graphics drivers must already be installed. The application does not install
-drivers or system packages. Driver/model failures fall back to another backend.
+LAUNCH AND STORAGE
 
-The single EXE extracts its bundled files into a temporary directory on launch;
-allow several GB of free space. First GPU startup can take longer for shader or
-kernel preparation. The EXE is unsigned. No installer is required.
+Double-click Refseek-Browser.exe. Keep the launcher open while using its
+browser page. Stop and exit saves completed indexing work and stops the
+app's model server. The server and browser interface bind to 127.0.0.1.
 
-New libraries are stored in Refseek-Browser-data beside the EXE. If you already
-have SemanticSearch-v2-data there, the app reuses it when the new folder does not
-exist. Your previous library is not renamed or overwritten. Put it in a writable folder. Copy that data folder too when moving your
-library. Original images stay where they are; moving them requires a rescan.
-Open Library & indexing to select folders. Each scanned folder has its own index
-and vectors. v1.9 and its library are left intact. v2 starts with a fresh library
-because it uses the requested Q8 model instead of the previous BF16 model.
+The EXE extracts bundled files into a temporary directory on each launch.
+Allow several gigabytes of free space. The EXE is unsigned and has no
+installer. Graphics drivers must already be installed.
 
-Style search includes the existing current and contrastive adapters. Contrastive
-is the default, the strongest performer in the prior artist benchmarks.
-Other aspects use the existing baseline. A manual method selection is remembered
-for its aspect while the page stays open. Saved adapter blends are unchanged.
-The adapter weights were trained on BF16 embeddings. The exact Q8 model/projector hashes are
-verified at startup. Behavioral probes compare against the training BF16 vectors
-with an explicit Q8 transfer tolerance (cosine >=0.9995; external servers keep
->=0.9999). Measured image agreement was 0.99979-0.99989 across four backend/device
-combinations. This compatibility check does not prove unchanged retrieval quality. Fresh evaluation of the quantized transfer remains necessary. Legacy
-BF16 research projection methods are hidden for this bundled Q8 runtime.
-Subject, pose, composition, viewpoint, color and lighting use current-model
-calibration. Pose remains embedding-based, without a joint detector.
+New catalogues use Refseek-Browser-data beside the EXE. An existing
+SemanticSearch-v2-data folder is reused when the new folder is absent.
+Keep that folder when updating or moving the app. Keep source pictures
+available too; after moving them, add and index their new location.
+Each scanned root has a separate index and vector snapshot.
 
-Useful command-line overrides:
+MODEL AND BACKENDS
+
+The bundle contains llama.cpp b11741, CUDA 12.4 runtime files, matching
+Vulkan/CPU builds, and the pinned Unsloth EmbeddingGemma 2 Q8_0 model and
+projector. assets-manifest.json records download URLs, versions and hashes.
+
+Auto tries compatible NVIDIA CUDA devices, then Vulkan, then CPU. Each
+candidate must pass text and image embedding checks. Failed attempts are
+recorded in the backend logs.
+
+STYLE AND COMPATIBILITY
+
+Contrastive is the default Style method. Current style adapter is also
+available. Other aspects use their existing baseline. Manual choices stay
+selected for their aspect while the page is open.
+
+The style adapters were trained on BF16 embeddings. Startup verifies the
+Q8 model/projector hashes and compares live probe embeddings to the frozen
+BF16 vectors. The bundled runtime requires cosine agreement >=0.9995;
+external servers retain >=0.9999. Recorded image agreement across four
+backend/device combinations was 0.99979-0.99989.
+
+Those probes check compatibility, not search accuracy. The full-data
+adapters and their Q8 transfer need evaluation on new collections. Legacy
+BF16 research projections are hidden for this Q8 runtime. Pose uses
+embeddings without a joint detector.
+
+COMMAND-LINE OPTIONS
+
   Refseek-Browser.exe --backend cpu
   Refseek-Browser.exe --backend vulkan
   Refseek-Browser.exe --backend cuda --device CUDA1
   Refseek-Browser.exe --data-dir "D:\SearchData"
   Refseek-Browser.exe --diagnose --backend auto
-Diagnostics write diagnostics.json beside the indexes and exit. Backend logs
-explain failed candidates. The model server and GUI bind only to 127.0.0.1.
 
-Rebuild from source (Python 3.12+, NumPy, Pillow, PyInstaller):
-  python fetch_assets.py
-  python -m PyInstaller --noconfirm --clean --workpath build-work/pyinstaller --distpath dist SemanticSearch-v2.spec
-All external download URLs, versions, sizes and SHA256 hashes are pinned in
-assets-manifest.json. Licenses and model source notices are embedded in the EXE.
+Diagnostics write diagnostics.json in the selected data directory and exit.
+Backend logs record why a candidate failed.
+
+BUILDING
+
+Follow python/README.md to install build dependencies and recover the
+complete resources from a matching release. Then run:
+
+  .\build.ps1 -Python .\.venv\Scripts\python.exe
+
+fetch_assets.py alone doesn't recover the trained adapter files or probes.
+The build includes component licenses and model source notices in the EXE.

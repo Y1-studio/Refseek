@@ -1,20 +1,12 @@
-# Refseek Browser
+# Refseek Browser source
 
-This edition opens a local search page in your default browser. Its small launcher window owns the model server: leave it open while searching, then use **Stop and exit**.
+This folder contains the Python edition. Its launcher starts the bundled model server and opens a local page in the default browser. Closing the launcher with **Stop and exit** saves completed indexing work and stops its model process.
 
-## Use the ready-made Windows app
-
-Download **Refseek-Browser.exe** from this repository's Releases. You do not need to install Python or start a separate server. Put it in its own writable folder, double-click it, and wait for the search page to open. Choose **Library & indexing**, add an image folder, then search with words or a reference image. Style starts with the Contrastive adapter.
-
-The EXE extracts its resources to a temporary directory each time it opens; allow several gigabytes of free space. It tries CUDA, Vulkan and CPU processing. Graphics drivers must already be installed.
-
-New installations save settings, indexes and logs in **Refseek-Browser-data** beside the EXE. When an existing **SemanticSearch-v2-data** folder is present and the new folder is absent, Refseek reuses the existing folder automatically. Keep that folder when replacing the EXE. The native edition uses its own data folder; keep the two downloads in separate application folders.
-
-Read the [browser guide](../docs/PYTHON_GUIDE.md) or [technical runtime notes](README.txt). The [native artist's guide](../docs/USER_GUIDE.md) illustrates shared search ideas, but its screenshots and exact control layout belong to the Rust edition.
+For the Windows download, use [Refseek-Browser.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Browser.exe) and follow the [browser guide](../docs/PYTHON_GUIDE.md). It includes Python and the model.
 
 ## Run from source on Windows
 
-Use Python **3.12 or later**, including Tcl/Tk. Run the following from this `python/` folder in PowerShell:
+Use Python 3.12 or later with Tcl/Tk. From this `python/` folder in PowerShell:
 
 ```powershell
 py -3.12 -m venv .venv
@@ -23,28 +15,32 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe launcher.py
 ```
 
-Resource recovery copies only the exact application resources listed in `resource-lock.json`; it never imports a user's library, settings or logs. Existing files with different hashes are preserved and reported as errors. The matching release contains the frozen style weights and compatibility probes, which model downloads alone do not provide. Alternatively recover from a matching unpacked v2 application folder using `--from-directory`.
+Resource recovery checks files against `resource-lock.json`. It copies application resources, including trained style weights and compatibility probes, and excludes user libraries, settings and logs. It reports an error instead of replacing an existing file with a different hash. Add `--verify-only` to check the source bundle without copying it.
 
-The pinned model/runtime URLs and hashes are recorded in `assets-manifest.json`. `fetch_assets.py` downloads those public files, but does not supply the frozen application-specific style resources. It is not a substitute for recovering the complete bundle.
+To recover from a matching unpacked application folder, use `--from-directory` instead of `--from-exe`. `assets-manifest.json` records the public model/runtime URLs and hashes. `fetch_assets.py` downloads those public files only; the complete release bundle is needed for the application-specific style resources.
 
-## Build the Windows EXE
+## Build the EXE
 
-After installing the build dependencies and recovering resources:
+After installing dependencies and recovering the resources:
 
 ```powershell
 .\build.ps1 -Python .\.venv\Scripts\python.exe
 ```
 
-The resulting application is `dist/Refseek-Browser.exe`. The source entry point `run.py` also provides the CLI and web server for developers who manage their own embedding API. Global options go before the subcommand; use `run.py --help` for details. The bundled desktop launcher and packaged release in this snapshot target Windows x64; no Linux AppImage is included.
+The output is `dist/Refseek-Browser.exe`. The source spec retains its older filename, `SemanticSearch-v2.spec`, but produces the Refseek-named EXE. This launcher and package target Windows x64; this release has no Linux AppImage.
+
+The separate `run.py` entry point provides a CLI and web server for developers managing their own embedding API. Global options go before the subcommand. Use `run.py --help` for the available commands.
 
 ## Check a build manually
 
-Use a separate diagnostic data folder:
+Use a separate data folder:
 
 ```powershell
 .\dist\Refseek-Browser.exe --diagnose --data-dir .\verification\python-diagnostic
 ```
 
-This checks model startup and embedding compatibility. It does not establish retrieval accuracy. Manually check indexing, text/image searches, Style, negative images, and fixed-frame arrow-key preview navigation before distributing a changed build.
+This checks model startup and text/image embedding compatibility, then writes `diagnostics.json` and exits. Before distributing a changed build, check indexing, text and image search, Style, negative images, and arrow-key preview browsing in the app. Startup probes don't measure retrieval accuracy.
 
-Third-party notices are [here](../THIRD_PARTY_NOTICES.md). No project-wide source license has been selected.
+[Runtime flags and model notes](README.txt) · [Third-party notices](../THIRD_PARTY_NOTICES.md)
+
+No project-wide source license has been selected.

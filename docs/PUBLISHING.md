@@ -1,20 +1,26 @@
-# Publish this repository and both Windows downloads
+# Publish source and downloads
 
-## Repository files
+The repository is [Y1-studio/Refseek](https://github.com/Y1-studio/Refseek). The current Windows release is [v2.0.1](https://github.com/Y1-studio/Refseek/releases/tag/v2.0.1).
 
-Create a repository named **Refseek**. Upload the contents of the prepared Refseek folder at the repository root, retaining the native/, python/, docs/ and third-party/ subfolders. README.md must be at the top level. Do not upload the sibling github-release folder as repository files.
+## Repository contents
 
-## Release downloads
+Put `README.md`, `native/`, `python/`, `docs/`, `third-party/` and `THIRD_PARTY_NOTICES.md` at the repository root. Upload their contents with those paths preserved. Keep the sibling `github-release/` folder out of Git.
 
-Create tag **v2.0.1**, title **Refseek 2.0.1 — Desktop and Browser**. Use the prepared RELEASE_NOTES.md as the description. Attach these four files from the sibling github-release folder:
+The source export excludes personal libraries, logs, credentials, training datasets and model binaries. Review additions before uploading. No project-wide source license has been selected; third-party notices apply to their named components.
 
-- Refseek-Desktop.exe
-- Refseek-Browser.exe
-- README.txt
-- SHA256SUMS.txt
+## Release assets
 
-Both EXEs belong in Release Assets. They do not belong in Git history. The top-level README links to the latest release and the two fixed asset names. Preserve those filenames in later releases or update the links.
+For a new app version, create a release with its version tag and prepared release notes. Attach these files from `github-release/`:
 
-After publishing, check that both source folders appear, all five screenshots render, both application links download the intended EXEs, and downloaded SHA256 values match SHA256SUMS.txt. The automatic Source code ZIP is the source tree, not the ready-to-run app.
+- `Refseek-Desktop.exe`
+- `Refseek-Browser.exe`
+- `README.txt`
+- `SHA256SUMS.txt`
 
-This prepared folder does not contain personal libraries, logs, credentials, training datasets or model binaries. Review any future additions before publishing. The source license has not been selected; this snapshot does not add one.
+Keep the EXEs in Release Assets, outside Git history. The main README links to the latest release using those asset names. Preserve the filenames or update the links.
+
+After publishing, open the main README and confirm that the guides and five screenshots load. Download both EXEs and compare their SHA256 hashes with `SHA256SUMS.txt`. Check that each EXE's visible name and version match the release.
+
+GitHub's automatic Source code archives contain the repository files. Users who want to run Refseek should download an EXE.
+
+For documentation-only edits, update the repository and source ZIP. The existing EXEs remain the same unless their code or bundled content changes.

@@ -1,79 +1,79 @@
-# Build from source
+# Build the desktop app
 
-The application is a Windows x64 native Rust/egui app. Its only inference process is a privately owned, loopback-only llama.cpp server. Python is used to prepare/package resources at build time; the delivered app does not invoke Python.
+The desktop edition uses Rust and egui on Windows x64. It starts its own llama.cpp process on a loopback address. Python prepares and packages resources during the build; the delivered app doesn't run Python.
 
 ## Requirements
 
-- Windows 10/11 x64.
-- Rust's GNU Windows toolchain, named `stable-x86_64-pc-windows-gnu`. The project requires Rust 1.92 or later; the exported source was built with Rust 1.96.
-- MinGW-w64 GCC. The build script detects `gcc.exe` on PATH or the usual `C:\msys64\mingw64\bin` location. Use `-MinGwBin` for a different installation.
-- Python 3.11+ for the standard-library-only resource and packaging scripts.
-- The matching runtime resource bundle, described below.
+- Windows 10 or 11, x64.
+- Rust 1.92 or later with the `stable-x86_64-pc-windows-gnu` toolchain. The exported source was built with Rust 1.96.
+- MinGW-w64 GCC and windres. The build script checks PATH and `C:\msys64\mingw64\bin`. Use `-MinGwBin` for another location.
+- Python 3.11 or later for the standard-library resource and packaging scripts.
+- A matching resource bundle from the desktop release.
 
-Toolchains must already be available. The supplied scripts do not install system software. Cargo fetches the versions in `Cargo.lock` on the first build; `-Offline` is available after the local cache is populated.
+Install the toolchains before building. The supplied scripts don't install system software. Cargo downloads the dependencies in `Cargo.lock`; use `-Offline` once the local cache is populated.
 
-## Recover matching resources
+Run the commands below from `native/`.
 
-Large resources and artwork fixtures are not included in Git. The application requires the exact models, runtime files, frozen style adapters and compatibility probes. Recover these from the matching downloadable EXE:
+## Recover resources
+
+Download the matching [desktop EXE](https://github.com/Y1-studio/Refseek/releases/tag/v2.0.1), then recover its resources:
 
 ```powershell
 python tooling/prepare-assets.py --from-exe "C:\Downloads\Refseek-Desktop.exe"
 ```
 
-Alternatively, use an existing matching assets folder:
+Or use an existing matching assets folder:
 
 ```powershell
 python tooling/prepare-assets.py --from-directory "C:\ArtSearchBuild\assets"
 ```
 
-Run all native build/resource commands from the `native/` folder. Resources are copied into `assets/`. The script checks every file against `resource-lock.json`, checks the embedded bundle manifest for EXE inputs, and refuses to replace a different existing resource. It never copies application libraries, settings or logs.
+The script copies resources into `assets/`, checks every file against `resource-lock.json`, and checks the embedded manifest for EXE inputs. It refuses to replace a different existing resource and excludes user libraries, settings and logs. Add `--verify-only` to check the source without copying it.
 
-To check a source bundle without copying anything, add `--verify-only`.
+`assets/assets-manifest.json` records the public model/runtime URLs and hashes. Those downloads don't contain Refseek's trained adapters and probes, so they aren't a substitute for the complete matching bundle.
 
-The pinned public model/runtime download URLs, revisions and hashes are also recorded in `assets/assets-manifest.json`. Those public downloads alone do not include this application's frozen style adapters and probes. A complete matching resource bundle is still required; the scripts do not substitute or retrain it.
-
-## Compile
+## Compile and run
 
 ```powershell
 .\build.ps1
 ```
 
-With a custom MinGW installation:
+For another MinGW location:
 
 ```powershell
 .\build.ps1 -MinGwBin "C:\Tools\mingw64\bin"
 ```
 
-Cargo downloads/cache and output stay in this project's `.cargo/` and `target/` directories. The checked-in `.cargo/config.toml` uses `gcc.exe` from PATH instead of a developer-specific absolute compiler path.
+Cargo's cache and build output stay in `.cargo/` and `target/`. The checked-in Cargo configuration uses `gcc.exe` from PATH.
 
-To run the development binary from the `native/` folder:
+Run the development binary with explicit resource and home directories:
 
 ```powershell
 $projectDir = (Get-Location).Path
 & ".\target\x86_64-pc-windows-gnu\release\semantic-search-native.exe" --home "$projectDir" --assets "$projectDir\assets"
 ```
 
-Its library is created under this project's `data/library`. Source folders retain their original files.
+The internal Cargo binary keeps its original name. Its library lives under `data/library` in the selected home directory.
 
-## Make the portable single EXE
+## Package one EXE
 
 ```powershell
 .\build.ps1 -Package
 ```
 
-For a different Python command or full interpreter path, use `-Python`:
+To select another Python interpreter:
 
 ```powershell
 .\build.ps1 -Package -Python "C:\Tools\Python312\python.exe"
 ```
 
-`tooling/package.py` appends the verified resource bundle to the native executable and writes `Refseek-Desktop.exe` plus `build-manifest.json` in the `native/` folder. Keep the recovered notices with the resources; the packager also collects available Rust dependency licenses from the local registry.
+`tooling/package.py` appends the verified resources to the native binary and writes `Refseek-Desktop.exe` and `build-manifest.json` here. Keep component notices with the recovered resources. The packager also collects available Rust dependency licenses from the local registry.
 
-The portable EXE extracts resources next to itself on first opening and reuses them on later launches. Its processing fallback is CUDA, then Vulkan, then CPU; real text/image compatibility probes must pass before a device is accepted. Only the app's own inference process is stopped when it closes.
+On first launch the EXE extracts resources beside itself and reuses them on later launches. It tries CUDA, Vulkan, then CPU, accepting a device only after text and image compatibility checks. On closing, it stops its own model process.
 
-## Manual verification
+## Manual checks
 
-This snapshot has manual real-model diagnostics rather than an automated test/CI suite. With the portable EXE:
+Use a separate writable `--home` and explicit `--assets` when another instance is running. These diagnostics use a `verification/` library:
 
 ```powershell
 .\Refseek-Desktop.exe --verify-math
@@ -81,8 +81,8 @@ This snapshot has manual real-model diagnostics rather than an automated test/CI
 .\Refseek-Desktop.exe --gui-smoke --interaction-smoke --image-input-check
 ```
 
-Use a separate writable `--home` directory and explicit `--assets` when running diagnostics alongside another instance. Diagnostics use a separate `verification/` library. They check adapter arithmetic, image transport, indexing, drag/drop, concurrent search, layout and viewer navigation. `--storage-check` adds snapshot/reuse/cancellation checks.
+The checks cover adapter arithmetic, image transport, indexing, drag/drop, search during indexing, layout and preview browsing. `--storage-check` adds snapshot, reuse and cancellation checks. This snapshot uses manual diagnostics rather than an automated test or CI suite.
 
-Small WebP inputs, including WebP data named `.jpg`, are decoded locally and sent as lossless full-frame PNG. The pinned standalone server cannot decode the direct WebP input without ffmpeg. Existing small JPEG/PNG transport bytes stay unchanged. No ffmpeg installation is required for these image searches.
+Small WebP files, including WebP bytes named `.jpg`, are decoded locally and sent as full-frame lossless PNG. The pinned server can't decode direct WebP without ffmpeg. Existing small JPEG/PNG transport stays unchanged; these image searches don't need an ffmpeg installation.
 
-These checks establish engineering compatibility, not fresh retrieval accuracy. Keep the original adapter weights, saved blends, probes and model pins intact.
+These checks measure engineering compatibility, not retrieval accuracy. Preserve model pins, trained weights, saved blends and probes when making unrelated changes.

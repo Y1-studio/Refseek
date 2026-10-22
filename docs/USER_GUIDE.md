@@ -1,424 +1,177 @@
-# Artist's guide
+# Desktop guide for artists
 
+Refseek finds pictures in the folders you add. Describe what you want, or give it an example image and choose which feature to match. Your original pictures stay in their folders.
 
-Find pictures in your own collection by describing them or showing the app
-an example. You can look for a subject, a drawing style, a pose, a colour
-palette, or an overall resemblance, even when the filenames are unhelpful.
+For your first search, follow the next three sections. The rest of this guide explains the controls.
 
-The results are files you already have. Your original artwork stays where
-you saved it. Search runs on your computer.
+## Open the app
 
-New here? Follow sections 1, 2 and 3 first. The other sections explain the
-controls when you need them.
+Download [Refseek-Desktop.exe](https://github.com/Y1-studio/Refseek/releases/latest/download/Refseek-Desktop.exe). An `.exe` is a Windows application: double-click it to open it. Windows sometimes hides the ending, so the file can appear as **Refseek-Desktop**.
 
+Keep the app in its own folder, such as `Documents\Art Search`. To make one, open Documents, right-click an empty space, choose **New > Folder**, and give it a name. Move the downloaded application there. If you received it in a ZIP file, right-click the ZIP and choose **Extract All** first.
 
-## 1. Open The App
+Leave several gigabytes free for its working files. On opening, a small startup window appears, followed by model-loading progress. Wait for loading to finish. The first launch takes longer because the app prepares its included resources.
 
-The program is called Refseek-Desktop.exe.
+The left menu has **Search**, **Library**, and **Settings**.
 
-An ".exe" file is a Windows application: double-click it (two quick clicks)
-to open the program.
-Windows may hide the ".exe" ending, so you might see just
-"Refseek-Desktop".
+## Add a picture folder
 
-If you received a ZIP file, extract it first: right-click the ZIP, choose
-"Extract All", and open the folder Windows creates.
+[![Library controls and indexing progress](screenshots/library.png)](screenshots/library.png)
 
-Keep the app in its own folder somewhere convenient, such as Documents.
-For example, make a folder called "Art Search" and put the application there.
-To make a folder, open Documents, right-click an empty space, choose New,
-then Folder, and type its name. Drag the application file into that folder.
-It needs room to save its working files, so leave several gigabytes free.
+1. Click **Library**, then **Browse…**.
+2. Choose a folder of pictures. Refseek also looks inside its subfolders.
+3. Leave **image** checked. Uncheck other file types if you only want pictures.
+4. Click **Add & index**.
 
-Open the application, then wait. A small opening window appears,
-followed by the main window with a loading message. The first opening takes
-longer because the app prepares the files it needs. When loading finishes,
-you can begin.
+Indexing creates the information Refseek needs to search each file. Start with a small folder you know well so you can judge the results before preparing a larger collection.
 
-The left side of the window has three places:
-  Search   - find and browse your files.  
-  Library  - choose which folders the app knows about.  
-  Settings - change the size, appearance and layout of the controls.  
+The progress display reports:
 
+| Label | Meaning |
+| --- | --- |
+| files/s processed | Files checked per second, including reused files. |
+| new files/s | Speed of preparing files that need new search information. |
+| embedded | Files with newly created search information. |
+| cached | Files whose saved search information was reused. |
+| skipped | Files the app couldn't prepare. |
+| Elapsed | Time spent on this job. |
+| ETA | Estimated time left. The estimate changes as work continues. |
 
-## 2. Add Your First Image Folder
+You can search while indexing runs. Results use completed work saved in batches; search again to include the latest additions. **Cancel indexing** stops after the current work can finish safely and keeps completed work.
 
-[![Library: choose a folder, start indexing, and watch the progress.](screenshots/library.png)](screenshots/library.png)
+## Search with words
 
-*Library: choose a folder, start indexing, and watch the progress. Click the image for a larger view.*
+[![Search description and reference-image controls](screenshots/search.png)](screenshots/search.png)
 
-Before searching, show the app where your pictures are.
+Open **Search**. In **What are you looking for?**, type a description such as `a person sitting on the floor` or `a forest path in warm evening light`. Click **Search library**, then click a result to preview it.
 
-1) Click "Library" on the left.
-2) Click "Browse..." and choose a folder containing your reference images.
-   It also looks inside the folders within that folder.  
-3) Make sure "image" is checked. Uncheck the other file types if you only
-   want to prepare pictures.  
-4) Click "Add & index".
-5) Wait for it to finish preparing your collection.
+Start with a short description. If the results are too broad, add a detail and search again. If an old reference image is selected, click **Clear** beneath it for a text-only search. That removes the search example from the controls; your image file stays on disk.
 
-"Indexing" means making a searchable catalogue of your files. The first run
-takes longer because the app looks at each image. It saves its search notes
-so that unchanged files can be reused next time.
+## Search with a reference image
 
-Your files keep their original names and locations. You can add more folders
-by repeating these steps.
+A reference image is the example Refseek compares against your collection. It can come from any folder, including one you haven't indexed.
 
-To try the app before adding a huge collection, start with a smaller folder
-you know well. This makes it easier to recognise useful results.
+Click **Choose an image…**, or drag a picture from a Windows folder into the app. Select a matching feature, then click **Search library**.
 
-What the progress numbers mean:
-  files/s processed - how many files it is checking each second.  
-  new files/s       - how quickly it is preparing files that need new work.  
-  embedded          - files for which it has created new search information.  
-  cached            - files whose existing search information was reused.  
-  skipped           - files it could not prepare.  
-  Elapsed           - time already spent.  
-  ETA               - an estimate of the time remaining; this can change.  
+| Feature | What it asks the search to match |
+| --- | --- |
+| Similarity | Overall resemblance, including subject, appearance and layout. |
+| Subject | What the picture contains. A rabbit photo can be a reference for rabbits drawn in other media. |
+| Style | How the picture is drawn, painted or rendered. An ink beetle can be a reference for similarly drawn plants. |
+| Pose | Body position, such as sitting or raising the arms. |
+| Viewpoint | Viewing angle, such as a side view or a view from above. |
+| Composition | The arrangement of subjects and shapes in the frame. |
+| Color | Colours and palette. |
+| Lighting | Light and shadow. |
 
-You can search while indexing continues. Searches use the work already saved.
-Newly prepared pictures appear in saved batches. Run the search again to see
-the latest additions.
+Refseek uses the whole image. Style and pose matches are approximate, and the subject or background can still affect the ranking. Pose matching doesn't detect body joints.
 
-"Cancel indexing" stops the job after its current work can finish safely.
-Completed work is kept. You can update the folder later to continue.
+For Style, start with the default **Contrastive style adapter**. **Current style adapter** and **Existing aspect method** offer other rankings of the same collection. Compare them with the same reference.
 
+**Aspect strength** sets how much the selected feature affects the ranking. Lower it to include more overall resemblance. Click **Search library** after adjusting it.
 
-## 3. Make A Simple Text Search
+Use **Change…** for another reference or **Clear** to remove it.
 
-[![Search: type a description, choose an optional reference, then search your library.](screenshots/search.png)](screenshots/search.png)
+## Combine a reference with words
 
-*Search: type a description, choose an optional reference, then search your library. Click the image for a larger view.*
+Choose an image, then enter a description. For example, use a painting as a Style reference and type `a house beside a lake` to describe the subject you want.
 
-1) Click "Search" on the left.
-2) In "What are you looking for?", describe the picture you want.
-3) Click "Search library".
-4) Click a result to see a larger preview.
+**Image weight** balances the two inputs: near 0 gives the words more influence; near 1 gives the image more influence. Start in the middle, change one control at a time, and search again to compare.
 
-Try descriptions such as:
-  a person sitting on the floor  
-  delicate botanical ink drawings  
-  a forest path in warm evening light  
-  a character seen from behind  
+Click **+ Want** to add another description box. For instance, enter `a forest path` in one box and `warm sunset light` in another. **Remove** deletes that extra description.
 
-Start with a clear, short description. Add a useful detail if the results are
-too broad. You can rewrite the description and search again.
+For text-only searches, **Match all** combines the descriptions, while **Match any** ranks a result by its best match to an individual description. Match all isn't a checklist: a result can fit one description better than another. With a reference image, the text descriptions are combined before being balanced against the image.
 
-If an old reference image is still selected, click "Clear" beneath it to
-return to a text-only search. This clears the search example, not the file.
+## Refine results
 
+[![Negative-image, exclusion and folder controls](screenshots/refine.png)](screenshots/refine.png)
 
-## 4. Search With An Example Image
-
-A "reference image" is the example the app compares your collection against.
-It can come from inside or outside your indexed folders.
-
-1) Click "Choose an image..." and select a picture.
-   Alternatively, drag an image file from a Windows folder into the app.  
-2) Choose what you want to match, using the buttons below the search text.
-3) Click "Search library".
-
-These matching buttons appear after you select a reference image:
-
-  Similarity  
-  Look for an overall resemblance: a mixture of subject, appearance and layout.  
-  Start here when you want "more pictures like this".  
-
-  Subject  
-  Concentrate on what the image contains.  
-  Example: use a rabbit photograph to look for other rabbits, including art  
-  in different media.  
-
-  Style  
-  Concentrate on how an image looks: drawing, painting or rendering style.  
-  Example: use an ink drawing of a beetle to look for similarly drawn plants  
-  or other subjects.  
-
-  Pose  
-  Concentrate on the position of a body.  
-  Example: look for other people sitting or raising their arms.  
-
-  Viewpoint  
-  Concentrate on the viewing angle, such as a side view or a view from above.  
-
-  Composition  
-  Concentrate on the arrangement of shapes and subjects within the frame.  
-
-  Color  
-  Concentrate on the colours and palette.  
-
-  Lighting  
-  Concentrate on light, shadow and the way a scene is lit.  
-
-These are suggestions rather than exact rules. Style and pose matching can
-be imperfect, and a subject or background can still influence the results.
-The app looks at the whole reference image; you do not need to crop it.
-
-For Style, leave "Contrastive style adapter" selected to start. It is the
-default style-search method. "Current style adapter" and "Existing aspect
-method" are alternative ways of ranking the same collection. You can compare
-them with the same reference.
-
-"Aspect strength" controls how much attention goes to your chosen feature.
-Increase it to emphasise that feature. Reduce it to bring back more of the
-overall resemblance. Click "Search library" after changing it.
-
-Use "Change..." to choose a different reference, or "Clear" to remove it.
-
-
-## 5. Combine An Image With Words
-
-Choose a reference image, then also enter a description.
-
-For example:
-  Reference: a painting whose look you like.  
-  Text: "a house beside a lake".  
-
-Choose a matching feature, such as Style, then search.
-
-"Image weight" controls the balance:
-  Toward 0 - give the words more influence.  
-  Toward 1 - give the reference image more influence.  
-
-Start near the middle and adjust one control at a time. Search again after
-each change so you can see what it did.
-
-
-## 6. Add More Than One Search Idea
-
-Click "+ Want" to add another description box. Use "Remove" beside a box to
-remove that extra idea.
-
-Example:
-  First box: a forest path  
-  Want 2:    warm sunset light  
-
-For text-only searches, choose:
-  Match all - combine the ideas into one search direction.  
-  Match any - let a strong match to any one of the ideas rank highly.  
-
-"Match all" is not a strict checklist: a result may fit one part better than
-another. With a reference image, the text ideas are always combined first,
-then balanced against the image using Image weight.
-
-Click "Search library" to apply your descriptions.
-
-
-## 7. Refine The Results
-
-[![Refine: choose a negative image, exclude concepts, or select folders.](screenshots/refine.png)](screenshots/refine.png)
-
-*Refine: choose a negative image, exclude concepts, or select folders. Click the image for a larger view.*
-
-Click "Refine results & search scope" to reveal extra controls.
-If a negative image is already selected, the heading says it is active.
+Open **Refine results & search scope** for the following controls. Search again after changing them.
 
 ### Negative image
-A negative image is a counter-example: "less like this, please".
 
-1) Open Refine.
-2) Click "Choose negative image...".
-3) Select the unwanted example.
-4) Click "Search library" again.
+A negative image is an example of what to move down the results. Click **Choose negative image…**, select a picture, and search again. **Negative image weight** sets how strongly it affects ranking.
 
-The app reduces the ranking of results that resemble that image. "Negative
-image weight" controls how strongly it does this. Start with the default.
+The comparison uses the whole negative image. It doesn't remove a particular object from the reference, and it can push down pictures you wanted. Use **Clear negative image** to remove its effect. The collapsed Refine heading indicates when a negative image is active.
 
-This compares the whole counter-example. It cannot isolate one unwanted
-object within it. It can also reduce matches you otherwise like, so try
-"Clear negative image" if the results become less useful.
-
-You can use a negative image with a text search or an image search.
+Negative images work with text searches and reference-image searches.
 
 ### Ignore these concepts
-Type unwanted concepts, one per line, such as:
-  text  
-  watermark  
 
-"Text exclusion weight" controls how strongly these ideas push results down.
-Clear the words to stop using those exclusions.
+Enter unwanted concepts, one per line, such as `text` or `watermark`. **Text exclusion weight** sets how strongly they lower a result's rank. Clear the words to stop applying them. Exclusions adjust scores; they don't guarantee that every matching file disappears.
 
-### File types
-The checkboxes choose which kinds of files can appear in results.
-For an artwork collection, "image" is the main one you need.
+### File types and folders
 
-### Folders
-These checkboxes choose where to search:
-  No folders checked - search all folders in your library.  
-  One folder checked - search that folder.  
-  Several checked    - search those selected folders.  
+Leave **image** checked for picture results. The folder checkboxes set the search area: no folders checked searches the whole library; checked folders restrict it to those locations.
 
-A folder's displayed address, such as H:\draw, is its location on your
-computer. You can select it with its checkbox without typing the address.
+A label such as `H:\draw` is a folder's address on your computer. Select its checkbox instead of typing the address.
 
-Search again after changing Refine controls.
+## Browse pictures
 
+[![Image preview with browsing controls](screenshots/viewer.png)](screenshots/viewer.png)
 
-## 8. Browse And Reuse Results
+Click a result for a large preview. **Previous / Next** or the arrow keys move through pictures: Left/Up goes back, Right/Down goes forward. **Esc** closes it. The preview keeps its size and position when pictures change.
 
-[![Viewer: use Previous/Next or the arrow keys to browse pictures.](screenshots/viewer.png)](screenshots/viewer.png)
+Inside the preview, **Use reference** searches with that picture; **Use negative** adds it to Refine; **Open original** opens the file in its usual Windows application.
 
-*Viewer: use Previous/Next or the arrow keys to browse pictures. Click the image for a larger view.*
+On a result card, **Use image** searches with that picture, and **Show file** reveals its Windows folder. The Next and Previous controls beside the page number switch result pages.
 
-Click a picture to open its large preview.
+Similarity scores order the results. A score isn't the probability that a picture is correct, and exclusions can lower it. When starting a different search, clear any old reference, extra Want descriptions or exclusions you no longer want.
 
-  Previous / Next - move through pictures.  
-  Left or Up key  - previous picture.  
-  Right or Down   - next picture.  
-  Esc             - close the preview.  
+## Update or remove a folder
 
-The preview stays the same size and position as you move between images.
+After adding, editing or deleting pictures, open **Library** and click **Update this folder** beside the folder. **Update all folders** checks every folder in the library. Unchanged files reuse their saved information.
 
-Inside the preview:
-  Use reference - search again using this picture as the example.  
-  Use negative  - put this picture into Refine as the counter-example.  
-  Open original - open the original file with its usual Windows application.  
+**Open folder** opens the source folder in Windows. **Remove from library** removes it from the catalogue and leaves its original files on your drive.
 
-On a result card:
-  Use image - use that picture as a reference and search again.  
-  Show file - reveal the original file in its Windows folder.  
+Keep external drives connected when searching their pictures. If you move or rename a source folder, add and index the new location, then remove the old library entry.
 
-Next and Previous near the page number move between pages of results.
+## Change display settings
 
-A similarity percentage helps rank results. It is not a percentage chance
-that the result is correct. Exclusions can lower a result's score.
+[![Settings for scale, text, theme and result layout](screenshots/settings.png)](screenshots/settings.png)
 
-When beginning a different search, check the words, extra Want boxes,
-reference image and Refine settings. Previous choices stay active until you
-change or clear them.
+Open **Settings**. Changes save automatically.
 
+| Control | Effect |
+| --- | --- |
+| UI scale | Resizes text, buttons and controls together. |
+| Text size | Changes the size of the words. |
+| Theme | Selects Dark, Light, or Follow Windows. |
+| Compact spacing and buttons | Reduces space between controls. |
+| Preferred card width | Sets the width of each result card. |
+| Thumbnail height | Sets the height of the small picture previews. |
+| Results per page | Sets how many results appear on each page. |
+| Show similarity scores and penalties | Displays ranking scores and the effect of exclusions. |
+| Show full file paths on result cards | Displays the folder address beneath each filename. |
 
-## 9. Keep Your Library Up To Date
+Scroll down if larger controls extend below the window. **Reset appearance & layout** restores display defaults and keeps the library.
 
-After adding, changing or deleting pictures in a source folder:
+Keyboard shortcuts: **Ctrl + +** increases UI scale, **Ctrl + -** decreases it, **Ctrl + 0** restores normal scale, and **Ctrl + Enter** runs a search.
 
-1) Open "Library".
-2) Find that folder.
-3) Click "Update this folder".
+Under **Local model**, start with **Backend for the next launch: Auto**. It tries a compatible NVIDIA graphics card through CUDA, then a graphics device through Vulkan, then the main processor through CPU. A manual backend change takes effect after closing and reopening Refseek.
 
-Use "Update all folders" to check every folder already in the library.
-The app reuses unchanged files, so updates often take less work than the
-first indexing run. It checks for changes when you ask it to update.
+## Keep your library during updates
 
-"Open folder" opens that source folder in Windows.
+The `data` folder beside the application holds settings, the search catalogue and working resources. Keep it. To move or back up Refseek, copy the whole application folder, including `data`. Your source picture folders also need to remain available.
 
-"Remove from library" removes the folder from the app's searchable catalogue.
-Your original files remain on your drive. You can add the folder again later.
+To update, close the app, replace the EXE in the same folder, keep `data`, and open the new EXE. If its name changed, update your shortcuts too.
 
-Keep an external drive connected when searching pictures stored on it.
-If you move or rename a source folder, add its new location and index it.
-Once that works, remove the old location from the library.
+Close normally with the X at the top right. Allow ongoing work time to finish closing.
 
+## Troubleshooting
 
-## 10. Make The Window Comfortable To Use
+**No results:** add a folder in Library and let indexing save some work. Check that its drive is connected, **image** is selected in Refine, and unwanted folder restrictions are cleared. Try a shorter description.
 
-[![Settings: change interface scale, text size, theme and result layout.](screenshots/settings.png)](screenshots/settings.png)
+**Unexpected results:** check for a previous reference, extra Want descriptions or active exclusions. Clear them and try Similarity before changing one control at a time.
 
-*Settings: change interface scale, text size, theme and result layout. Click the image for a larger view.*
+**New pictures are missing:** use **Update this folder**, then search again. During indexing, newly prepared files appear after the next saved batch.
 
-Open "Settings".
+**A picture won't load:** supported image inputs include JPG/JPEG, PNG, WebP, GIF, BMP and TIFF. Export layered Photoshop or Clip Studio artwork to PNG or JPEG for indexing. Incomplete or damaged files can still fail. **Open latest indexing details** in Library shows skipped-file information.
 
-  UI scale  
-  Makes the entire interface larger or smaller: text, buttons and controls.  
-  Try this first if everything feels too small.  
+**The library is already open:** use the existing app window, or close it before opening another instance with the same library.
 
-  Text size  
-  Changes the size of the words.  
+**The app can't save:** move its application folder somewhere writable, such as Documents, and check for free disk space.
 
-  Theme  
-  Choose Dark, Light, or Follow Windows to match your computer's appearance.  
+For an error report, include the exact message or a screenshot, what you clicked, and the image or folder involved.
 
-  Compact spacing and buttons  
-  Fits controls closer together. Turn it off if you prefer more breathing room.  
-
-  Preferred card width  
-  Changes how wide each result's small display box is.  
-
-  Thumbnail height  
-  Changes the height of the small picture previews.  
-
-  Results per page  
-  Chooses how many results appear before you use the next page.  
-
-  Show similarity scores and penalties  
-  Shows the ranking numbers and the effect of exclusions.  
-
-  Show full file paths on result cards  
-  Shows each file's folder address beneath its name.  
-
-Appearance changes happen immediately and save automatically. Scroll down
-if larger controls extend below the visible part of the window.
-
-"Reset appearance & layout" restores the default display settings.
-It keeps your library.
-
-Keyboard shortcuts:
-  Ctrl and +   - make the interface larger.  
-  Ctrl and -   - make it smaller.  
-  Ctrl and 0   - restore the normal scale.  
-  Ctrl + Enter - run a search.  
-
-In "Local model", leave "Backend for the next launch" on Auto to start.
-This chooses which part of your computer does the processing. CUDA uses a
-compatible NVIDIA graphics card; Vulkan uses a compatible graphics device;
-CPU uses the main processor. These are advanced choices, and any change
-there takes effect after you close and reopen the app.
-
-
-## 11. Saving, Moving And Updating The App
-
-The app creates a folder called "data" beside the application. It holds your
-search catalogue, settings and the working files the app needs.
-
-Keep that data folder. If you move or back up the app, copy its whole folder,
-including data. Your original image folders also need to remain available.
-
-When receiving an updated Refseek-Desktop.exe:
-1) Close the running app and let it finish closing.
-2) Replace the old application file in the same folder.
-3) Keep the existing data folder.
-4) Open the new application.
-
-To close normally, click the X at the top right. If it is doing work, allow
-it a moment to finish closing safely.
-
-
-## 12. If Something Does Not Work
-
-"I have no results."
-  Add a folder in Library and let indexing prepare some pictures.  
-  Check that the folder is connected and contains supported images.  
-  In Search, clear unwanted folder restrictions and check "image" in Refine.  
-  Try a simpler description.  
-
-"The results are strange."
-  Check for an old reference image, extra Want boxes or active exclusions.  
-  Clear the negative image and ignored concepts, then try Similarity.  
-  Change one control at a time so you can see its effect.  
-
-"My new pictures are missing."
-  Use "Update this folder" in Library, then run your search again.  
-  If indexing is still running, some new pictures may not be saved yet.  
-
-"A picture will not load."
-  Common supported formats include JPG/JPEG, PNG, WebP, GIF, BMP and TIFF.  
-  For layered drawing files, such as Photoshop or Clip Studio documents,  
-  export a PNG or JPEG copy and index the folder containing those copies.  
-  A file that is incomplete or damaged may still be unreadable.  
-
-"It says the library is already open."
-  Find the existing app window and use it, or close it before opening another.  
-
-"The app cannot save its files."
-  Keep its folder somewhere you can save files, such as Documents, and check  
-  that the drive has free space.  
-
-"I still get an error."
-  Copy the exact message or take a screenshot. Note what you clicked and  
-  which image or folder you were using, then send that information to the  
-  person helping you with the app. "Open latest indexing details" in Library  
-  can provide more information about skipped files.  
-
-
-Technical build notes are in [BUILDING.md](NATIVE_BUILDING.md). You can use the app without reading them.
-
+[Back to the overview](../README.md) · [Build instructions](NATIVE_BUILDING.md)

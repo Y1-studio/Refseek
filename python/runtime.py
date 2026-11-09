@@ -44,20 +44,51 @@ class Runtime:
     def devices(self, backend):
         exe = ROOT/'runtimes'/backend/'llama-server.exe'
         try:
-            p = subprocess.run([str(exe), '--list-devices'], cwd=exe.parent,
-                               capture_output=True, text=True, errors='replace',
-                               timeout=30, creationflags=HIDDEN)
-            output = p.stdout + p.stderr
+            self.progress('Checking '+backend.upper()+' devices…')
+            with subprocess.Popen([str(exe), '--list-devices'], cwd=exe.parent, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, errors='replace', creationflags=HIDDEN) as probe:
+                deadline = time.monotonic() + 120
+                while True:
+                    try:
+                        output, _ = probe.communicate(timeout=.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if self.cancel.is_set() or time.monotonic() >= deadline:
+                            probe.kill()
+                            probe.communicate()
+                            if self.cancel.is_set():
+                                raise RuntimeError('Startup cancelled')
+                            raise OSError('Device enumeration timed out')
             prefix = 'CUDA' if backend == 'cuda' else 'Vulkan'
             devices=re.findall(r'^\s*('+prefix+r'\d+): (.+)$', output, re.M)
-            return [(dev,name) for dev,name in devices if not any(
+            usable = [(dev,name) for dev,name in devices if not any(
                 software in name.lower() for software in ('llvmpipe','lavapipe','swiftshader','software renderer'))]
-        except (OSError, subprocess.TimeoutExpired):
+            if not usable:
+                self.attempts.append(dict(backend=backend, stage='enumeration', error='No usable GPU reported'))
+            return usable
+        except OSError as exc:
+            self.attempts.append(dict(backend=backend, stage='enumeration', error=str(exc)))
             return []
+
+    def candidates(self, backend, device):
+        for kind in ('cuda', 'vulkan'):
+            if backend in ('auto', kind):
+                for identifier, name in self.devices(kind):
+                    if device is None or identifier == device:
+                        yield kind, identifier, name
+        if backend in ('auto', 'cpu'):
+            yield 'cpu', 'none', 'CPU'
 
     def start(self, backend='auto', device=None):
         from egl.api import EmbedClient, image_item
         from egl.config import Settings
+        from egl.store import _atomic_write
+
+        def record_attempts():
+            try:
+                _atomic_write(self.data/'backend-attempts.json', json.dumps(self.attempts, indent=2).encode('utf-8'))
+            except OSError:
+                pass
         self.progress('Verifying bundled Q8 model and projector…')
         manifest=json.loads((ROOT/'assets-manifest.json').read_text(encoding='utf-8'))
         for asset in manifest['assets']:
@@ -69,14 +100,7 @@ class Runtime:
                     digest.update(block)
             if path.stat().st_size!=asset['size'] or digest.hexdigest()!=asset['sha256']:
                 raise RuntimeError('Bundled model integrity check failed: '+asset['name'])
-        candidates = []
-        if backend in ('auto', 'cuda'):
-            candidates += [('cuda', d, name) for d, name in self.devices('cuda') if not device or d == device]
-        if backend in ('auto', 'vulkan'):
-            candidates += [('vulkan', d, name) for d, name in self.devices('vulkan') if not device or d == device]
-        if backend in ('auto', 'cpu'): candidates.append(('cpu', 'none', 'CPU'))
-        if not candidates: raise RuntimeError('No usable '+backend+' device detected. Try automatic or CPU mode.')
-        for kind, dev, name in candidates:
+        for kind, dev, name in self.candidates(backend, device):
             if self.cancel.is_set(): raise RuntimeError('Startup cancelled')
             self.progress('Starting '+kind.upper()+': '+name)
             port = free_port(); exe = ROOT/'runtimes'/kind/'llama-server.exe'
@@ -94,7 +118,7 @@ class Runtime:
                 if self.job and not self.job[0].AssignProcessToJobObject(self.job[1],int(self.process._handle)):
                     raise RuntimeError('Could not attach model server to its lifetime guard')
                 url = 'http://127.0.0.1:'+str(port)
-                deadline = time.monotonic()+180
+                deadline = time.monotonic() + (180 if kind == 'cpu' else 600)
                 while True:
                     if self.cancel.is_set(): raise RuntimeError('Startup cancelled')
                     if self.process.poll() is not None: raise RuntimeError('Server exited: '+str(self.process.returncode))
@@ -108,8 +132,9 @@ class Runtime:
                                     data_dir=str(self.data), web_port=8088, timeout=90)
                 client = EmbedClient(settings)
                 probes = json.loads((ROOT/'style-models'/'model-probes.json').read_text())
-                vectors = [client.embed_one(probes['text']), client.embed_one(image_item(
-                    (ROOT/'style-models'/'probe-image.bin').read_bytes(), probes['mime']))]
+                with client.cancel_scope(self.cancel.is_set):
+                    vectors = [client.embed_one(probes['text']), client.embed_one(image_item(
+                        (ROOT/'style-models'/'probe-image.bin').read_bytes(), probes['mime']))]
                 scores = {}
                 self.probe_vectors = dict(zip(('text', 'image'), vectors))
                 for label, vec in zip(('text', 'image'), vectors):
@@ -124,6 +149,8 @@ class Runtime:
                 self.info = dict(backend=kind, device=dev, device_name=name, llama_release='b11741',
                                  model='EmbeddingGemma 2 Q8_0', api_url=url+'/v1',
                                  bf16_probe_cosines=scores, attempts=self.attempts, log=str(logpath))
+                self.info['fallback'] = backend == 'auto' and kind == 'cpu'
+                record_attempts()
                 settings.bundled_q8 = True
                 settings.runtime_info = self.info
                 # Readiness probes have a short deadline; real image batches
@@ -132,9 +159,15 @@ class Runtime:
                 self.progress('Ready: '+kind.upper()+' / '+name)
                 return settings, client
             except Exception as exc:
+                if self.cancel.is_set():
+                    self.stop_process()
+                    record_attempts()
+                    raise RuntimeError('Startup cancelled') from exc
                 self.attempts.append(dict(backend=kind, device=dev, error=str(exc), log=str(logpath)))
+                record_attempts()
                 self.stop_process()
                 self.progress(kind.upper()+' failed; trying the next device/backend.')
+        record_attempts()
         raise RuntimeError('All embedding backends failed. See logs in '+str(self.data)+'\n'+json.dumps(self.attempts))
 
     def stop_process(self):

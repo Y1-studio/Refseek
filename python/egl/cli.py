@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--kinds", help="only index these file types (comma list, e.g. image,pdf,code; 'all' clears a saved filter)")
     pi.add_argument("--rescan", action="store_true",
                     help="also rescan all existing index folders (default: only the given folders)")
+    pi.add_argument("--verify-contents", action="store_true", help="hash every file; legacy records without hashes are re-embedded")
     pi.add_argument("--watch", type=int, nargs="?", const=30, default=0,
                     metavar="SECONDS", help="keep watching for changes (default 30s)")
     pi.add_argument("--hidden", action="store_true", help="include dotfiles and dotfolders")
@@ -72,6 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw = sub.add_parser("web", help="start the local web UI")
     pw.add_argument("--port", type=int)
     pw.add_argument("--host")
+    accounts = sub.add_parser('accounts', help='set up local browser accounts')
+    accounts.add_argument('action', choices=['init', 'key', 'on', 'off'])
+    accounts.add_argument('--username', default='owner', help='owner username for init')
 
     sub.add_parser("status", help="show index + API info")
     sub.add_parser("doctor", help="check configuration and API")
@@ -93,6 +97,9 @@ def settings_from_args(args, parser) -> Settings:
         threads=args.threads,
         batch=args.batch,
     )
+    if args.data_dir and args.threads is None and 'EG_THREADS' not in os.environ:
+        from .index_preferences import load
+        s.threads = load(s.data_dir)['prepare_workers']
     if args.cmd == "index" and args.hidden:
         s.hidden = True
     if args.cmd == "web":
@@ -114,12 +121,12 @@ def cmd_index(args, settings):
     if index.records:
         print(f"existing index: {len(index.records)} vectors ({index.dim or '?'}d)")
     folders = list(args.folders)
-    kinds = args.kinds or getattr(settings, "index_kinds", "") or None
+    kinds = args.kinds if args.kinds is not None else (settings.index_kinds if os.environ.get("EG_INDEX_KINDS") else None)
     rescan = args.rescan or settings.rescan
     log = None if args.quiet else print
     while True:
         res = Indexer(settings, client, log=log).run(folders, media=args.media, kinds=kinds,
-                                                     rescan=rescan)
+                                                     rescan=rescan, verify_contents=args.verify_contents)
         skipped = list(res.get("skipped") or [])
         errors = list(res.get("errors") or [])
         total_vectors = len(Index.load(settings.data_dir).records)
@@ -338,6 +345,26 @@ PNG_1PX = (
 )
 
 
+def cmd_accounts(args, settings):
+    from getpass import getpass
+    from .accounts import Accounts, make_key, set_account_mode
+
+    if args.action == 'key':
+        path = make_key(settings.data_dir)
+        print(f'Session key is configured in {path}.')
+        return 0
+    if args.action in ('on', 'off'):
+        set_account_mode(settings.data_dir, args.action == 'on')
+        print('Access mode saved. Restart Refseek to apply it.')
+        return 0
+    password = getpass('Owner password: ')
+    if password != getpass('Confirm password: '):
+        raise ValueError('Passwords do not match.')
+    Accounts.setup(settings.data_dir, args.username, password)
+    print('Owner account created. Restart Refseek and sign in to manage guests.')
+    return 0
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -351,6 +378,7 @@ def main(argv=None) -> int:
         "migrate": cmd_migrate,
         "reset": cmd_reset,
         "forget": cmd_forget,
+        'accounts': cmd_accounts,
     }
     try:
         return handlers[args.cmd](args, settings)

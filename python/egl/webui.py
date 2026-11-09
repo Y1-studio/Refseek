@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -13,8 +14,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .api import EmbedClient, l2norm
+from .account_http import AccountHTTP, allowed_file, guest_index
+from .accounts import Accounts, read_env
 from .config import Settings
 from .indexer import Indexer
+from .portable import config_file, env_path, shared_data_dir
 from .scan import INDEX_KINDS
 from .search import Searcher
 from .store import Index
@@ -26,23 +30,22 @@ except Exception:
 
 
 def _thumbnail(data: bytes, max_side: int = 512):
-    """Downscale image bytes for grid thumbnails. Returns (bytes, ctype) or None
-    when already small (original bytes are served as-is)."""
+    """Decode full-frame previews into a browser-supported image format."""
     if _PILImage is None:
         return None
     import io
+    from PIL import ImageOps
 
-    img = _PILImage.open(io.BytesIO(data))
-    if max(img.size) <= max_side:
-        return None
-    img.draft("RGB", (max_side, max_side))
-    img.thumbnail((max_side, max_side), _PILImage.LANCZOS)
-    out = io.BytesIO()
-    if "A" in img.getbands():
-        img.save(out, "PNG")
-        return out.getvalue(), "image/png"
-    img.convert("RGB").save(out, "JPEG", quality=82)
-    return out.getvalue(), "image/jpeg"
+    with _PILImage.open(io.BytesIO(data)) as image:
+        image.draft('RGB', (max_side, max_side))
+        img = ImageOps.exif_transpose(image)
+        img.thumbnail((max_side, max_side), _PILImage.Resampling.LANCZOS)
+        out = io.BytesIO()
+        if 'A' in img.getbands() or 'transparency' in img.info:
+            img.convert('RGBA').save(out, 'PNG')
+            return out.getvalue(), 'image/png'
+        img.convert('RGB').save(out, 'JPEG', quality=82)
+        return out.getvalue(), 'image/jpeg'
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -59,68 +62,78 @@ PAGE = r"""<!doctype html>
     --accent:#1f6feb; --accent-hi:#58a6ff; --accent-ink:#fff;
     --accent-soft:rgba(31,111,235,.15);
     --green:#7ee787; --red:#f85149;
+    --header:rgba(14,17,22,.9); --ui-zoom:1; --card-width:230px; --thumb-height:155px;
     --sans:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
     --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
   }
+  :root[data-theme="light"] {
+    color-scheme:light; --bg:#f2f5f9; --surface:#fff; --surface2:#edf1f6; --inset:#f7f9fc;
+    --border:#9eabb9; --border-soft:#cbd3dd; --text:#182536; --muted:#425366; --faint:#526477;
+    --accent:#185bc0; --accent-hi:#0d4eaa; --green:#12683a; --red:#ad2222; --header:rgba(242,245,249,.94);
+  }
   * { box-sizing:border-box; }
   [hidden] { display:none!important; }
+  :root[data-account="guest"] #method_report { display:none!important; }
   .aspectbox { border:1px solid var(--border); border-radius:12px; padding:14px 16px;
-      margin-bottom:16px; background:#11161d; }
+      margin-bottom:16px; background:var(--inset); }
   .aspectbox .bar { gap:7px; margin-bottom:8px; }
-  .aspect { padding:8px 12px; font-size:12.5px; font-weight:600; }
+  .aspect { padding:8px 12px; font-size:0.78125rem; font-weight:600; }
   .aspect[aria-pressed=true] { background:var(--accent); border-color:var(--accent-hi); }
-  .aspectbox label { color:var(--muted); font-size:12px; }
+  .aspectbox label { color:var(--muted); font-size:0.75rem; }
   #focus_strength { flex:1; max-width:330px; accent-color:var(--accent-hi); }
-  #focus_hint { color:var(--muted); font-size:12px; margin:0; }
-  #focus_amount { min-width:40px; font:12px var(--mono); }
-  .chip.locked { pointer-events:none; opacity:.55; }
+  #focus_hint { color:var(--muted); font-size:0.75rem; margin:0; }
+  #focus_amount { min-width:40px; font:0.75rem var(--mono); }
+  .chip:disabled { opacity:.55; }
   .drop img { max-width:100%; object-fit:contain; }
-  body { margin:0; font:15px/1.55 var(--sans); background:var(--bg); color:var(--text);
+  body { margin:0; font:0.9375rem/1.55 var(--sans); background:var(--bg); color:var(--text);
       min-height:100vh; }
   header { position:sticky; top:0; z-index:10; padding:16px 22px 13px;
-      background:rgba(14,17,22,.9); backdrop-filter:blur(10px);
+      background:var(--header); backdrop-filter:blur(10px);
       border-bottom:1px solid var(--border-soft); }
+  :root[data-large-ui] header { position:static; }
   header .wrap { max-width:1080px; margin:0 auto; }
-  h1 { font-size:20px; margin:0 0 3px; font-weight:650; letter-spacing:0; }
-  .sub { color:var(--muted); font-size:12.5px; font-family:var(--mono); }
+  h1 { font-size:1.25rem; margin:0 0 3px; font-weight:650; letter-spacing:0; }
+  .sub { color:var(--muted); font-size:0.78125rem; font-family:var(--mono); }
   main { padding:22px 22px 70px; max-width:1080px; margin:0 auto; }
   .panel { border:1px solid var(--border-soft); border-radius:18px; padding:20px 22px;
       margin-bottom:22px; background:var(--surface); }
-  .panel.index { border-radius:12px; background:#11161d; }
-  .navtabs { display:flex;gap:8px;margin-top:14px;align-items:center; }
+  .panel.index { border-radius:12px; background:var(--inset); }
+  header .wrap, .panel { zoom:var(--ui-zoom); }
+  .navtabs { display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;align-items:center; }
   .navtabs [role=tab] { background:transparent;border-color:transparent;color:var(--muted);padding:9px 18px; }
   .navtabs [aria-selected=true] { background:var(--accent-soft);border-color:var(--accent);color:var(--text); }
-  .tabbadge { display:inline-block;font:11px var(--mono);margin-left:7px;color:var(--green); }
-  .tools { margin-top:8px;font-size:12px;color:var(--muted); }
+  .tabbadge { display:inline-block;font:0.6875rem var(--mono);margin-left:7px;color:var(--green); }
+  .tools { margin-top:8px;font-size:0.75rem;color:var(--muted); }
   .tools summary,.refine summary { cursor:pointer; }
   .tools a { display:inline-block;color:var(--accent-hi);margin:7px 14px 0 0;text-decoration:none; }
   .refine { margin:10px 0 16px;border:1px solid var(--border-soft);border-radius:12px;padding:10px 14px;color:var(--muted); }
   .refine[open] summary { margin-bottom:12px; }
-  .libraryintro { color:var(--muted);font-size:13px;margin-top:-5px; }
+  .libraryintro { color:var(--muted);font-size:0.8125rem;margin-top:-5px; }
   .rootrow .rname { white-space:normal;word-break:break-word; }
-  .rootstorage { margin-top:4px;font:11px var(--mono);color:var(--faint); }
+  #dataloc, #index_backend, #indexreport, #idxstatus { overflow-wrap:anywhere; min-width:0; }
+  .rootstorage { margin-top:4px;font:0.6875rem var(--mono);color:var(--faint); }
   .rootrow { flex-wrap:wrap; }
-  .panel > h2 { font-size:15px; color:var(--text); margin:0 0 14px; font-weight:600; }
-  .panel h3 { font-size:13px; color:var(--muted); margin:18px 0 8px; font-weight:600; }
+  .panel > h2 { font-size:0.9375rem; color:var(--text); margin:0 0 14px; font-weight:600; }
+  .panel h3 { font-size:0.8125rem; color:var(--muted); margin:18px 0 8px; font-weight:600; }
   .panel h3:first-of-type { margin-top:0; }
-  .hint { color:var(--faint); font-size:12px; margin-top:7px; }
+  .hint { color:var(--faint); font-size:0.75rem; margin-top:7px; }
   .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
   .bar:last-child { margin-bottom:0; }
   input[type=search], input[type=text] { flex:1 1 340px; padding:12px 15px; border-radius:12px;
-      border:1px solid var(--border); background:var(--inset); color:var(--text); font-size:15px;
+      border:1px solid var(--border); background:var(--inset); color:var(--text); font-size:0.9375rem;
       outline:none; transition:border-color .15s, box-shadow .15s; min-width:0; font-family:var(--sans); }
-  #q { font-size:18px; padding:15px 18px; border-radius:14px; }
+  #q { font-size:1.125rem; padding:15px 18px; border-radius:14px; }
   #q::placeholder { color:var(--faint); }
   input[type=search]:focus, input[type=text]:focus, input[type=number]:focus, select:focus {
       border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
   input[type=number] { width:76px; padding:11px 10px; border-radius:12px; font-family:var(--mono);
       border:1px solid var(--border); background:var(--inset); color:var(--text); outline:none; }
   input.want { flex:1 1 340px; padding:10px 14px; border-radius:12px;
-      border:1px dashed var(--border); background:var(--inset); color:var(--text); font-size:14px; outline:none; }
+      border:1px dashed var(--border); background:var(--inset); color:var(--text); font-size:0.875rem; outline:none; }
   select { padding:11px 12px; border-radius:12px; border:1px solid var(--border);
       background:var(--inset); color:var(--text); outline:none; font-family:var(--sans); }
   button { padding:11px 20px; border-radius:12px; border:1px solid #30363d;
-      background:#238636; color:#fff; font-weight:700; font-size:14px;
+      background:#238636; color:#fff; font-weight:700; font-size:0.875rem;
       cursor:pointer; transition:filter .12s, transform .05s; white-space:nowrap;
       font-family:var(--sans); }
   button:hover { filter:brightness(1.12); }
@@ -137,47 +150,56 @@ PAGE = r"""<!doctype html>
   }
   .chips { display:flex; gap:7px; flex-wrap:wrap; margin-bottom:14px; align-items:center; }
   .chip { padding:5px 12px; border-radius:999px; border:1px solid var(--border);
-      background:var(--surface2); color:var(--muted); font-size:12.5px; cursor:pointer;
+      background:var(--surface2); color:var(--muted); font-size:0.78125rem; cursor:pointer;
       user-select:none; transition:color .12s, border-color .12s; font-family:var(--mono); }
   .chip:hover { border-color:var(--faint); color:var(--text); }
   .chip.on { background:var(--accent); border-color:var(--accent); color:#fff;
       font-weight:600; }
   .drop { border:1.5px dashed var(--border); border-radius:12px; padding:14px 16px;
-      text-align:center; color:var(--muted); margin-bottom:16px; font-size:13px;
+      text-align:center; color:var(--muted); margin-bottom:16px; font-size:0.8125rem;
       display:flex; align-items:center; justify-content:center; gap:10px; flex-wrap:wrap;
       background:var(--inset); transition:border-color .15s; }
   .drop.over { border-color:var(--accent); color:var(--text); }
-  .drop.small { padding:9px 12px; font-size:12px; }
+  .drop.small { padding:9px 12px; font-size:0.75rem; }
   .drop.small img { max-height:56px; }
   .drop img { max-height:90px; vertical-align:middle; border-radius:8px; }
   #rmimg { padding:4px 12px; margin-left:4px; }
-  #results { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:12px; }
+  #results { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,var(--card-width)),1fr)); gap:12px; }
   .card { background:var(--surface); border:1px solid var(--border-soft); border-radius:10px;
       overflow:hidden; display:flex; flex-direction:column; text-decoration:none; color:inherit;
       transition:border-color .12s; }
   .card:hover { border-color:var(--accent); }
-  .thumb { height:155px; background:#0d1117 center/cover no-repeat; display:flex;
-      align-items:center; justify-content:center; font-size:36px; color:var(--faint); }
+  .thumb { height:var(--thumb-height); background:var(--inset) center/cover no-repeat; display:flex;
+      align-items:center; justify-content:center; font-size:2.25rem; color:var(--faint); }
+  .thumb img { display:block; width:100%; height:100%; object-fit:cover; }
+  .thumb-unavailable { padding:12px; text-align:center; font-size:0.8125rem; color:var(--muted); }
   .body { padding:11px 13px 12px; display:flex; flex-direction:column; gap:2px; }
-  .kind { font-size:11px; color:var(--green); font-weight:700; font-family:var(--mono); }
-  .name { font-weight:600; font-size:13.5px; word-break:break-all; }
-  .snip { color:var(--muted); font-size:12px; max-height:57px; overflow:hidden; }
+  .kind { font-size:0.6875rem; color:var(--green); font-weight:700; font-family:var(--mono); }
+  .name { font-weight:600; font-size:0.84375rem; word-break:break-all; }
+  .result-path { display:none; overflow-wrap:anywhere; color:var(--muted); }
+  .show-paths .result-path { display:block; }
+  .hide-scores .result-score { display:none; }
+  .compact-cards .body { padding:5px 8px; }
+  .compact-cards .snip { display:none; }
+  .settings-grid { display:grid; gap:.75rem; grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr)); }
+  .settings-grid label { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; }
+  .snip { color:var(--muted); font-size:0.75rem; max-height:57px; overflow:hidden; }
   .meta { display:flex; justify-content:space-between; align-items:center; color:var(--faint);
-      font-size:11px; margin-top:8px; font-family:var(--mono); }
+      font-size:0.6875rem; margin-top:8px; font-family:var(--mono); }
   .meta span:last-child { background:var(--surface2); border:1px solid var(--border);
       border-radius:999px; padding:1px 9px; color:var(--muted); }
-  .status { color:var(--muted); font-size:12.5px; margin-bottom:12px; font-family:var(--mono); }
+  .status { color:var(--muted); font-size:0.78125rem; margin-bottom:12px; font-family:var(--mono); }
   .status:empty { display:none; }
   .err { color:var(--red); }
-  .lab { font-size:12.5px; color:var(--muted); align-self:center; margin-right:2px; }
-  label.check { display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--muted);
+  .lab { font-size:0.78125rem; color:var(--muted); align-self:center; margin-right:2px; }
+  label.check { display:inline-flex; align-items:center; gap:8px; font-size:0.8125rem; color:var(--muted);
       cursor:pointer; }
   label.check:hover { color:var(--text); }
   input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); cursor:pointer; }
   input[type=range] { flex:1 1 200px; accent-color:var(--accent); cursor:pointer; }
   .idxbar { display:flex; gap:8px; flex-wrap:wrap; }
   .idxbar input { flex:1 1 300px; padding:11px 14px; border-radius:12px;
-      border:1px solid var(--border); background:var(--inset); color:var(--text); font-size:14px;
+      border:1px solid var(--border); background:var(--inset); color:var(--text); font-size:0.875rem;
       outline:none; min-width:0; }
   .idxrow { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; }
   .idxrow .spacer { flex:1; }
@@ -192,15 +214,19 @@ PAGE = r"""<!doctype html>
   .idxfoot .status { flex:1; margin:0; }
   .pager { display:flex; gap:12px; align-items:center; justify-content:center; margin:18px 0 6px; }
   .pager[hidden] { display:none; }
-  .pager button { padding:8px 18px; font-size:13px; }
+  .pager button { padding:8px 18px; font-size:0.8125rem; }
   .rootrow { display:flex; gap:10px; align-items:center; padding:8px 12px;
       border:1px solid var(--border-soft); border-radius:10px; margin-bottom:8px;
       background:var(--inset); }
   .rootrow .rname { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
-      white-space:nowrap; font-family:var(--mono); font-size:12.5px; }
-  .rootrow .rcounts { color:var(--faint); font-size:11.5px; font-family:var(--mono);
+      white-space:nowrap; font-family:var(--mono); font-size:0.78125rem; }
+  .rootrow .rcounts { color:var(--faint); font-size:0.71875rem; font-family:var(--mono);
       white-space:nowrap; }
-  .rootrow button { padding:6px 12px; font-size:12.5px; }
+  .rootrow button { padding:6px 12px; font-size:0.78125rem; }
+  #foldertree { max-height:18rem; overflow:auto; }
+  .folder-filter-row { display:flex; align-items:center; flex-wrap:wrap; gap:0.45rem; margin:0.2rem 0; }
+  .folder-toggle { padding:0.15rem; width:2rem; flex:none; }
+  .folder-label { min-width:0; overflow-wrap:anywhere; }
   html { scrollbar-gutter:stable; }
   #lightbox { position:fixed; inset:0; z-index:50; display:flex; align-items:center;
       justify-content:center; padding:24px; }
@@ -213,19 +239,20 @@ PAGE = r"""<!doctype html>
   #lb-img { display:block; width:100%; height:100%; object-fit:contain; }
   #lb-img[hidden] { display:none; }
   #lb-box figcaption { padding:12px 16px 14px; }
-  #lb-name { font-weight:650; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #lb-meta { color:var(--muted); font-size:12px; font-family:var(--mono); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #lb-box figcaption { max-height:58%; overflow:auto; }
+  #lb-name { font-weight:650; font-size:0.875rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #lb-meta { color:var(--muted); font-size:0.75rem; font-family:var(--mono); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #lb-nav { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:8px; }
-  #lb-position { min-width:110px; text-align:center; font-size:12px; }
-  #lb-snip { color:var(--muted); font-size:12.5px; margin-top:8px; max-height:120px;
+  #lb-position { min-width:110px; text-align:center; font-size:0.75rem; }
+  #lb-snip { color:var(--muted); font-size:0.78125rem; margin-top:8px; max-height:120px;
       overflow:auto; white-space:pre-wrap; }
   #lb-snip:empty { display:none; }
-  .lbrow { display:flex; gap:10px; margin-top:12px; }
+  .lbrow { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
   @media (max-width:640px) {
     header { padding:12px 14px 10px; }
     main { padding:14px 14px 60px; }
     .panel { padding:14px 14px; }
-    #results { grid-template-columns:1fr 1fr; gap:10px; }
+    #results { gap:10px; }
     .thumb { height:110px; }
   }
 </style>
@@ -233,8 +260,10 @@ PAGE = r"""<!doctype html>
 <body>
 <header>
   <div class="wrap">
-    <h1>Refseek <span class="lab">Browser · 2.0.1</span></h1>
+    <h1>Refseek <span class="lab" id="appversion">Browser</span></h1>
     <div class="sub" id="sub">loading index…</div>
+    <div class="bar" id="account_controls" hidden><a href="/users" id="manage_users" hidden>Manage users</a>
+      <button id="sign_out" class="ghost">Sign out</button></div>
     <details class="tools"><summary>Tools & reports</summary>
       <a href="/match">Picture ↔ text match</a><a href="/focus">Compare image aspects</a>
       <a href="/style-report">Style adapter comparison</a><a href="/research">Aspect research</a>
@@ -242,6 +271,7 @@ PAGE = r"""<!doctype html>
     <nav class="navtabs" role="tablist" aria-label="Workspace">
       <button id="search_tab" role="tab" aria-selected="true" aria-controls="search_panel">Search</button>
       <button id="library_tab" role="tab" aria-selected="false" aria-controls="library_panel" tabindex="-1">Library & indexing <span class="tabbadge" id="library_badge"></span></button>
+      <button id="settings_tab" role="tab" aria-selected="false" aria-controls="settings_panel" tabindex="-1">Settings</button>
     </nav>
   </div>
 </header>
@@ -254,9 +284,11 @@ PAGE = r"""<!doctype html>
     <div class="bar">
       <input id="k" type="number" value="24" min="1" max="200" title="results per page">
       <button id="go">Search</button>
+      <button class="ghost" id="searchall" hidden>Search all folders</button>
       <button class="ghost" id="clear">Clear</button>
     </div>
-    <details class="refine" id="refine_search"><summary>Refine search · extra terms & exclusions</summary>
+    <div id="folderonly" class="hint" hidden></div>
+    <details class="refine" id="refine_search"><summary id="refine_label">Refine search · extra terms & exclusions</summary>
     <div class="bar">
       <input id="nx" type="search" placeholder="Exclude… (optional)" title="things you do not want to see">
       <input id="nxw" type="number" value="0.5" min="0" max="2" step="0.1" title="exclude strength: how hard the Exclude term pushes results down">
@@ -269,9 +301,22 @@ PAGE = r"""<!doctype html>
         <option value="max">match any</option>
       </select>
     </div>
+    <div class="drop small" id="dropneg">
+      <img id="negpreview" hidden alt="">
+      <span id="negdropmsg">Drop an image here to ignore its look (optional)</span>
+      <button id="chooseneg" class="ghost">Choose ignore-image</button>
+      <input id="negfile" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/bmp" hidden>
+      <input id="negw" type="number" value="1.0" min="0" max="2" step="0.1" title="ignore-image strength">
+      <button id="rmneg" class="ghost" hidden title="remove ignore-image">×</button>
+    </div>
     </details>
     <div class="chips" id="chips"></div>
-    <div class="chips" id="rchips" hidden></div>
+    <details class="refine" id="folderfilters" hidden>
+      <summary>Folders and subfolders</summary>
+      <p class="hint">Open a folder with +. Include and Skip apply to its subfolders. Deeper rules take precedence. With no Include rules, Refseek searches every folder except those you skip.</p>
+      <div class="bar"><button class="ghost" id="collapsefolders">Collapse all</button><button class="ghost" id="clearfolders">Clear folder filters</button><span class="hint" id="foldercount"></span></div>
+      <div id="foldertree"></div>
+    </details>
     <div class="drop" id="drop">
       <img id="preview" hidden alt="">
       <span id="dropmsg">Drop a full image here, or choose one to search visually</span>
@@ -306,14 +351,6 @@ PAGE = r"""<!doctype html>
       <p id="focus_hint">Upload a full image, or open a result and choose “Use as reference”. No cropping needed.</p>
       <p class="hint" id="method_hint" hidden></p>
       <p class="hint" id="style_bundle_hint">Checking installed style adapters…</p>
-    </div>
-    <div class="drop small" id="dropneg">
-      <img id="negpreview" hidden alt="">
-      <span id="negdropmsg">Drop an image here to ignore its look (optional)</span>
-      <button id="chooseneg" class="ghost">Choose ignore-image</button>
-      <input id="negfile" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/bmp" hidden>
-      <input id="negw" type="number" value="1.0" min="0" max="2" step="0.1" title="ignore-image strength">
-      <button id="rmneg" class="ghost" hidden title="remove ignore-image">×</button>
     </div>
     <div class="bar" id="blendrow" hidden>
       <span class="lab">text</span>
@@ -355,11 +392,41 @@ PAGE = r"""<!doctype html>
     <div class="hint">Only ticked types get indexed — update a folder or choose Update all folders to apply changes.
       This choice is saved for future runs.</div>
     <h3>Progress</h3>
+    <p class="hint" id="index_backend"></p>
     <div class="idxtrack" id="idxtrack"><div class="idxfill" id="idxfill"></div></div>
     <div class="idxfoot">
       <div class="status" id="idxstatus"></div>
       <button class="ghost" id="cancelb" hidden title="Stop indexing now (embedded work stays saved)">Cancel</button>
     </div>
+    <div class="bar">
+      <button class="ghost" id="cleanupindex">Clean up old snapshots</button>
+      <button class="ghost" id="indexdetails">Show latest indexing details</button>
+    </div>
+    <p class="hint" id="cleanupresult" aria-live="polite"></p>
+    <div id="indexreport" hidden></div>
+  </section>
+  <section class="panel" id="settings_panel" role="tabpanel" aria-labelledby="settings_tab" hidden>
+    <h2 id="settings_title">Settings</h2>
+    <p class="hint" id="client_settings_hint" hidden>Appearance and result preferences are saved in this browser.</p>
+    <h3>Appearance</h3>
+    <div class="settings-grid">
+      <label>UI scale <input id="ui_zoom" type="range" min="75" max="200" value="100" step="5"><output id="ui_zoom_value">100%</output></label>
+      <label>Text size <input id="ui_text" type="range" min="12" max="24" value="16"><output id="ui_text_value">16</output></label>
+      <label>Card width <input id="ui_cards" type="range" min="160" max="380" value="230" step="10"></label>
+      <label>Thumbnail height <input id="ui_thumbs" type="range" min="90" max="300" value="155" step="5"></label>
+      <label>Results per page <input id="ui_results" type="number" min="1" max="200" value="24"></label>
+      <label>Theme <select id="ui_theme"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+      <label><input id="ui_compact" type="checkbox"> Compact cards</label>
+      <label><input id="ui_scores" type="checkbox" checked> Show scores</label>
+      <label id="ui_paths_option"><input id="ui_paths" type="checkbox"> Show full paths</label>
+    </div>
+    <div id="index-dim-controls"><h3>Indexing</h3>
+      <label>CPU preparation workers <input id="prepareworkers" type="number" min="1" step="1" value="2"></label>
+      <p class="hint">Defaults to two workers. Your count and file-type selections are remembered for future runs.</p>
+      <h3>Library</h3>
+      <label>Index dimensions <select id="indexdim"></select></label>
+      <p class="hint" id="dimension_note" aria-live="polite"></p>
+      <div id="dimension_sizes"></div></div>
   </section>
   <div id="lightbox" hidden>
     <div id="lb-back"></div>
@@ -373,6 +440,8 @@ PAGE = r"""<!doctype html>
         <div class="lbrow">
           <button id="lb-open">Open original</button>
           <button id="lb-reference" class="ghost" hidden>Use as reference</button>
+          <button id="lb-negative" class="ghost" hidden>Use negative</button>
+          <button id="lb-folder" class="ghost" hidden>Search this folder only</button>
           <button class="ghost" id="lb-close">Close</button>
         </div>
       </figcaption>
@@ -380,32 +449,142 @@ PAGE = r"""<!doctype html>
   </div>
 </main>
 <script>
-const state = { kinds: new Set(), query: "", image: null, negimage: null, rootsSel: new Set(),
+const state = { kinds: new Set(['image']), query: "", image: null, negimage: null, rootsSel: new Set(), skipFolders: new Set(), onlyFolder: null,
   idxKinds: new Set(), jobTimer: null, wasRunning: false, lastJobSeen: null, page: 0, focus: "original" };
 let searchSerial = 0, searchController = null;
 let visibleResults = [], currentPageHasMore = false;
 let selectedTab = "search";
+const role = document.documentElement.dataset.account;
+const guest = role === 'guest';
+const tabs = guest ? ['search','settings'] : ['search','library','settings'];
+document.getElementById('account_controls').hidden = !role;
+document.getElementById('manage_users').hidden = role !== 'owner';
+document.getElementById('library_tab').hidden = guest;
+document.querySelector('.tools').hidden = guest;
+document.getElementById('index-dim-controls').hidden = guest;
+document.getElementById('ui_paths_option').hidden = guest;
+if (guest) {
+  document.getElementById('settings_tab').textContent = 'Client settings';
+  document.getElementById('settings_title').textContent = 'Client settings';
+  document.getElementById('client_settings_hint').hidden = false;
+  document.getElementById('searchall').textContent = 'Search all shared folders';
+}
+document.getElementById('sign_out').onclick = async () => {
+  const response = await fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if (response.ok) location.replace('/login');
+};
 function showTab(name, focusTab=false) {
-  selectedTab = name === "library" ? "library" : "search";
-  for (const tab of ["search","library"]) {
+  selectedTab = tabs.includes(name) ? name : 'search';
+  for (const tab of tabs) {
     const button=document.getElementById(tab+"_tab");
     const active=tab === selectedTab;
     button.setAttribute("aria-selected",String(active));button.tabIndex=active ? 0 : -1;
     document.getElementById(tab+"_panel").hidden=!active;
     if(active && focusTab)button.focus();
   }
-  history.replaceState(null,"",selectedTab === "library" ? "#library" : location.pathname);
+  history.replaceState(null,"",selectedTab === "search" ? location.pathname : '#' + selectedTab);
 }
-for (const name of ["search","library"]) {
+for (const [index, name] of tabs.entries()) {
   const button=document.getElementById(name+"_tab");
   button.onclick=()=>showTab(name);
   button.onkeydown=event=>{
     if(["ArrowLeft","ArrowRight","Home","End"].includes(event.key)) {
-      event.preventDefault();showTab(event.key === "Home" ? "search" : event.key === "End" ? "library" : name === "search" ? "library" : "search",true);
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+        : (index + tabs.length + (event.key === 'ArrowLeft' ? -1 : 1)) % tabs.length;
+      showTab(tabs[next], true);
     }
   };
 }
-showTab(location.hash === "#library" ? "library" : "search");
+showTab(location.hash.slice(1));
+const preferenceIds = ['ui_zoom','ui_text','ui_cards','ui_thumbs','ui_results','ui_theme','ui_compact','ui_scores'];
+if (!guest) preferenceIds.push('ui_paths');
+function applyAppearance(save=false) {
+  const read = id => document.getElementById(id);
+  const root = document.documentElement;
+  root.style.setProperty('--ui-zoom', Number(read('ui_zoom').value) / 100);
+  root.toggleAttribute('data-large-ui', Number(read('ui_zoom').value) * Number(read('ui_text').value) >= 2400);
+  root.style.fontSize = read('ui_text').value + 'px';
+  root.style.setProperty('--card-width', read('ui_cards').value + 'px');
+  root.style.setProperty('--thumb-height', read('ui_thumbs').value + 'px');
+  root.dataset.theme = read('ui_theme').value === 'light' ? 'light' : 'dark';
+  root.classList.toggle('compact-cards',read('ui_compact').checked);
+  root.classList.toggle('hide-scores',!read('ui_scores').checked);
+  root.classList.toggle('show-paths',!guest && read('ui_paths').checked);
+  read('ui_zoom_value').value = read('ui_zoom').value + '%';
+  read('ui_text_value').value = read('ui_text').value;
+  read('k').value = read('ui_results').value;
+  if (save) {
+    const settings = Object.fromEntries(preferenceIds.map(id => [id, read(id).type === 'checkbox' ? read(id).checked : read(id).value]));
+    try { localStorage.setItem(appearanceKey, JSON.stringify(settings)); } catch (_) {}
+  }
+}
+const appearanceKey = guest ? 'refseek-guest-appearance' : 'refseek-browser-appearance';
+try {
+  const saved = JSON.parse(localStorage.getItem(appearanceKey) || '{}');
+  for (const id of preferenceIds) {
+    const input = document.getElementById(id);
+    if (input.type === 'checkbox' && typeof saved[id] === 'boolean') input.checked = saved[id];
+    if (input.type !== 'checkbox' && typeof saved[id] === 'string') input.value = saved[id];
+  }
+} catch (_) {}
+for (const id of preferenceIds) document.getElementById(id).oninput = () => applyAppearance(true);
+document.getElementById('k').onchange = event => {
+  document.getElementById('ui_results').value = event.currentTarget.value;
+  applyAppearance(true);
+};
+applyAppearance();
+
+let indexSettings = null;
+function renderDimension(settings) {
+  if (!settings) return;
+  indexSettings = settings;
+  const workers = document.getElementById('prepareworkers');
+  workers.max = settings.max_prepare_workers;
+  workers.value = settings.prepare_workers;
+  workers.disabled = state.wasRunning;
+  const select = document.getElementById('indexdim');
+  select.replaceChildren(...[...new Set([...settings.choices, settings.dimension])].map(dim => new Option(dim === 768 ? '768 (default)' : dim, dim)));
+  select.value = settings.dimension;
+  select.disabled = settings.locked || state.wasRunning;
+  document.getElementById('dimension_note').textContent = settings.locked
+    ? 'This library keeps its existing dimensions.' : 'Choose dimensions before indexing an empty library.';
+  const table = document.getElementById('dimension_sizes');
+  table.replaceChildren();
+  for (const estimate of settings.estimates) {
+    const row = document.createElement('div');
+    row.textContent = `${estimate.dimension} dimensions · ${formatBytes(estimate.total_bytes)} per 10,000 vectors`
+      + (estimate.native_bytes ? ` including ${formatBytes(estimate.native_bytes)} for Style` : '');
+    table.append(row);
+  }
+  const note = document.createElement('p'); note.className = 'hint';
+  note.textContent = 'Estimates cover vectors only. Metadata and the recovery copy take additional space.'; table.append(note);
+}
+document.getElementById('indexdim').onchange = async event => {
+  const select = event.currentTarget, dimension = Number(select.value);
+  select.disabled = true;
+  try {
+    const data = await (await fetch('/api/index_settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dimension})})).json();
+    if (data.error) throw new Error(data.error);
+    renderDimension(data);
+  } catch (error) { renderDimension(indexSettings); document.getElementById('dimension_note').textContent = error.message; }
+};
+let indexPreferenceSave = Promise.resolve(), indexPreferenceError = null;
+function saveIndexPreferences(changes) {
+  indexPreferenceSave = indexPreferenceSave.then(async () => {
+    const response = await fetch('/api/index_settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(changes)});
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    indexPreferenceError = null;
+    renderDimension(data);
+  }).catch(error => {
+    indexPreferenceError = error.message;
+    if (indexSettings) renderDimension(indexSettings);
+    idxSet('Could not save indexing preferences: ' + error.message, true);
+  });
+  return indexPreferenceSave;
+}
+document.getElementById('prepareworkers').onchange = event => saveIndexPreferences({prepare_workers:Number(event.target.value)});
 let styleModels = {available: false, research_available: false};
 // Explicit choices belong to their aspect; temporary loading fallbacks do not.
 const aspectMethodChoices = Object.create(null);
@@ -432,8 +611,8 @@ function syncFocus() {
   const methodSelect = document.getElementById("aspect_method");
   const available=["baseline"];
   if(state.focus === "style" && styleModels.available) available.push("style_current","style_contrastive");
-  if(styleModels.research_available !== false && ["subject","style"].includes(state.focus)) available.push("pisco");
-  if(styleModels.research_available !== false && ["subject","style","pose"].includes(state.focus)) available.push("model_aware");
+  if(!guest && styleModels.research_available !== false && ["subject","style"].includes(state.focus)) available.push("pisco");
+  if(!guest && styleModels.research_available !== false && ["subject","style","pose"].includes(state.focus)) available.push("model_aware");
   const recommended=state.focus === "style" && styleModels.available
     ? (styleModels.default_method || "style_contrastive") : "baseline";
   const preferred=aspectMethodChoices[state.focus] || recommended;
@@ -471,8 +650,11 @@ function syncFocus() {
      imageOnly() ? " Image results only; text blend, exclusions and folder filters still apply." : "") +
     (focused ? " 0% restores overall similarity; 100% uses the selected method. Separation is approximate." : "");
   document.querySelectorAll("#chips [data-kind]").forEach(el => {
-    el.classList.toggle("locked", imageOnly());
-    el.classList.toggle("on", imageOnly() ? el.dataset.kind === "image" : state.kinds.has(el.dataset.kind));
+    const imageResults = imageOnly();
+    const on = imageResults ? el.dataset.kind === 'image' : state.kinds.has(el.dataset.kind);
+    el.disabled = imageResults;
+    el.classList.toggle('on', on);
+    el.setAttribute('aria-pressed', String(on));
   });
 }
 document.querySelectorAll("button[data-focus]").forEach(b => b.onclick = () => {
@@ -489,7 +671,9 @@ async function loadStyleModels() {
   const hint = document.getElementById("style_bundle_hint");
   try {
     styleModels = await (await fetch("/api/style_models")).json();
-    hint.textContent = styleModels.available
+    if (guest) {
+      hint.textContent = styleModels.available ? 'Trained Style adapters available.' : 'Trained Style adapters unavailable.';
+    } else hint.textContent = styleModels.available
       ? `Style adapters installed · ${styleModels.artists} artists · ${styleModels.images.toLocaleString()} images. Style defaults to the Contrastive adapter; you can choose another method.` + (styleModels.quantization_transfer ? " BF16-trained adapters transferred to Q8; retrieval quality needs fresh evaluation." : "")
       : "Trained style adapters unavailable: " + (styleModels.error || "missing model bundle");
   } catch (error) { hint.textContent = "Could not check the installed style adapters."; }
@@ -501,7 +685,7 @@ async function loadStyleModels() {
   }
 }
 loadStyleModels();
-let allRoots = [], lastRoots = null, idxKindInit = false, lastKinds = null;
+let folderChildren = new Map(), openFolders = new Set(), idxKindInit = false;
 const IDX_ALL = ["image","pdf","docx","pptx","xlsx","epub","odt","text","code","audio","video"];
 const KIND_LABEL = {image:"image",pdf:"pdf",docx:"doc",pptx:"slides",xlsx:"sheet",epub:"book",
   odt:"doc",text:"text",code:"code",audio:"audio",video:"video"};
@@ -509,85 +693,133 @@ const ICON = {pdf:"📄",docx:"📝",pptx:"📊",xlsx:"📈",epub:"📚",odt:"�
   audio:"🎵",video:"🎬",image:"🖼️"};
 
 async function boot() {
-  const s = await (await fetch("/api/status")).json();
-  let base = `${s.vectors.toLocaleString()} vectors · ${s.files.toLocaleString()} files · ${s.dim||"?"}d · ` +
-    `model ${s.model||"?"} via ${s.api_type||"?"} @ ${s.api_url||"?"}` +
-    (s.app_version ? ` · app v${s.app_version}` : "");
-  if (s.runtime) base += ` · ${s.runtime.backend.toUpperCase()} / ${s.runtime.device_name}`;
-  if (s.index_error) base += " · INDEX PROBLEM: " + s.index_error;
-  document.getElementById("sub").textContent = base;
-  document.getElementById("dataloc").textContent = s.data_dir ? "index at " + s.data_dir : "";
-  const storage=s.storage || {};
-  document.getElementById("storage_summary").textContent = storage.format === "per-folder"
-    ? `${storage.folders} independent folder indexes · unchanged folders keep their existing files · automatic checkpoints`
-    : "Combined index; it will be split into folder indexes automatically when saved.";
-  renderRoots(s.root_stats || []);
-  const kinds = Object.keys(s.kinds || {}).sort();
-  const liveKinds = new Set(kinds);
-  if (lastKinds === null) {
-    state.kinds = new Set(kinds);
+  const response = await fetch("/api/status");
+  if (response.status === 401 && role) { location.replace('/login'); return; }
+  const s = await response.json();
+  if (!response.ok) { document.getElementById("sub").textContent = s.error || 'Could not load the library.'; return; }
+  document.getElementById('appversion').textContent = s.app_version ? `Browser · ${s.app_version}` : 'Browser';
+  if (guest) {
+    document.getElementById("sub").textContent = `${s.files.toLocaleString()} shared files`;
   } else {
-    const prevKinds = new Set(lastKinds);
-    for (const k of [...state.kinds]) if (!liveKinds.has(k)) state.kinds.delete(k);
-    for (const k of kinds) if (!prevKinds.has(k)) state.kinds.add(k);
+    let base = `${s.vectors.toLocaleString()} vectors · ${s.files.toLocaleString()} files · ${s.index_settings?.dimension || s.dim || "?"}d · ` +
+      `model ${s.model||"?"} via ${s.api_type||"?"} @ ${s.api_url||"?"}` +
+      (s.app_version ? ` · app v${s.app_version}` : "");
+    if (s.runtime) base += ` · ${s.runtime.backend.toUpperCase()} / ${s.runtime.device_name}`;
+    if (s.index_error) base += " · INDEX PROBLEM: " + s.index_error;
+    document.getElementById("sub").textContent = base;
+    document.getElementById('index_backend').textContent = s.runtime
+      ? `Embedding backend · ${s.runtime.backend.toUpperCase()} · ${s.runtime.device_name}` +
+        (s.runtime.fallback ? ' · No GPU backend could start. See backend-attempts.json.' : '')
+      : 'Embeddings use the configured server. File scanning and preparation use the CPU.';
+    document.getElementById("dataloc").textContent = s.data_dir ? "index at " + s.data_dir : "";
+    const storage=s.storage || {};
+    document.getElementById("storage_summary").textContent = storage.format === "per-folder"
+      ? `${storage.folders} independent folder indexes · unchanged folders keep their existing files · automatic checkpoints`
+      : "Combined index; it will be split into folder indexes automatically when saved.";
+    renderRoots(s.root_stats || []);
+    renderCleanup(s.last_cleanup);
+    renderDimension(s.index_settings);
+    renderIdxKinds(s.kind_filter, s.files);
   }
-  lastKinds = kinds.slice();
+  renderSearchKinds(s.kinds);
+  folderChildren = new Map();
+  for (const row of s.folder_tree || []) {
+    if (!folderChildren.has(row.parent)) folderChildren.set(row.parent, []);
+    folderChildren.get(row.parent).push(row);
+  }
+  renderFolders();
+  syncFocus();
+  if (!guest) pollJob();
+}
+function renderSearchKinds(counts = {}) {
   const box = document.getElementById("chips");
   box.innerHTML = "";
-  if (kinds.length) {
-    const lab = document.createElement("span");
-    lab.className = "lab";
-    lab.textContent = "search in:";
-    box.appendChild(lab);
-  }
-  for (const k of kinds) {
-    const el = document.createElement("span");
-    el.className = "chip" + (state.kinds.has(k) ? " on" : "");
-    el.textContent = (KIND_LABEL[k] || k) + " · " + (s.kinds[k] || 0);
-    el.onclick = () => { el.classList.toggle("on"); toggleKind(k, el.classList.contains("on")); };
+  const lab = document.createElement('span');
+  lab.className = 'lab';
+  lab.textContent = 'Search file types';
+  box.appendChild(lab);
+  for (const k of new Set(['image', 'text', ...IDX_ALL, ...Object.keys(counts)])) {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'chip';
+    el.textContent = (k === 'image' ? 'Images' : k === 'text' ? 'Text' : KIND_LABEL[k] || k) +
+      (counts[k] ? ` · ${counts[k].toLocaleString()}` : '');
+    el.onclick = () => {
+      if (state.kinds.has(k)) state.kinds.delete(k); else state.kinds.add(k);
+      syncFocus();
+      state.page = 0;
+      if (document.getElementById('status').textContent) run();
+    };
     el.dataset.kind = k;
     box.appendChild(el);
   }
-  renderRootChips(s.roots);
-  renderIdxKinds(s.kind_filter);
-  syncFocus();
-  pollJob();
 }
-function toggleKind(k, on) { on ? state.kinds.add(k) : state.kinds.delete(k); }
 
-function renderRootChips(roots) {
-  allRoots = (roots || []).slice().sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-  const live = new Set(allRoots);
-  if (lastRoots === null) {
-    state.rootsSel = new Set(allRoots);
-  } else {
-    const prev = new Set(lastRoots);
-    for (const r of [...state.rootsSel]) if (!live.has(r)) state.rootsSel.delete(r);
-    for (const r of allRoots) if (!prev.has(r)) state.rootsSel.add(r);
-  }
-  lastRoots = allRoots.slice();
-  const box = document.getElementById("rchips");
-  box.innerHTML = "";
-  box.hidden = allRoots.length <= 1;
-  if (!allRoots.length) return;
-  const lab = document.createElement("span");
-  lab.className = "lab";
-  lab.textContent = "look in:";
-  box.appendChild(lab);
-  for (const r of allRoots) {
-    const el = document.createElement("span");
-    el.className = "chip" + (state.rootsSel.has(r) ? " on" : "");
-    const parts = r.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
-    el.textContent = parts[parts.length - 1] || r;
-    el.title = r;
-    el.onclick = () => {
-      if (state.rootsSel.has(r)) state.rootsSel.delete(r); else state.rootsSel.add(r);
-      el.classList.toggle("on");
-    };
-    box.appendChild(el);
-  }
+function folderFiltered() { return !!state.onlyFolder || !!state.rootsSel.size || !!state.skipFolders.size; }
+function clearFolderFilters() {
+  state.onlyFolder = null;
+  state.rootsSel.clear();
+  state.skipFolders.clear();
 }
-function rootsNarrowed() { return allRoots.length > 1 && state.rootsSel.size < allRoots.length; }
+function syncFolderControls() {
+  document.getElementById('searchall').hidden = !folderFiltered();
+  document.getElementById('clearfolders').disabled = !folderFiltered();
+  const only = document.getElementById('folderonly');
+  only.hidden = !state.onlyFolder;
+  const folder = state.onlyFolder;
+  const label = guest && folder ? folder.split(/[\\/]/).filter(Boolean).pop() : folder;
+  only.textContent = label ? `Folder only · ${label}` : '';
+  document.getElementById('foldercount').textContent = `${state.rootsSel.size} included · ${state.skipFolders.size} skipped`;
+}
+function renderFolders(focusPath) {
+  const box = document.getElementById('foldertree');
+  document.getElementById('folderfilters').hidden = !folderChildren.has(null) && !folderFiltered();
+  box.replaceChildren();
+  function append(parent, depth) {
+    for (const folder of folderChildren.get(parent) || []) {
+      const folderLabel = guest || depth ? folder.label : folder.path;
+      const row = document.createElement('div');
+      row.className = 'folder-filter-row';
+      row.style.paddingInlineStart = `min(25%, ${depth * 1.15}rem)`;
+      const toggle = document.createElement('button');
+      const open = openFolders.has(folder.path);
+      toggle.type = 'button'; toggle.className = 'ghost folder-toggle';
+      toggle.textContent = open ? '−' : '+';
+      toggle.setAttribute('aria-label', `${open ? 'Collapse' : 'Expand'} ${folder.label}`);
+      toggle.setAttribute('aria-expanded', String(open));
+      if (!folderChildren.has(folder.path)) { toggle.disabled = true; toggle.style.visibility = 'hidden'; }
+      toggle.onclick = () => {
+        open ? openFolders.delete(folder.path) : openFolders.add(folder.path);
+        renderFolders(folder.path);
+      };
+      row.append(toggle);
+      for (const [label, set, other] of [['Include',state.rootsSel,state.skipFolders], ['Skip',state.skipFolders,state.rootsSel]]) {
+        const tag = document.createElement('label'); tag.className = 'check';
+        const input = document.createElement('input'); input.type = 'checkbox'; input.checked = set.has(folder.path);
+        input.setAttribute('aria-label', `${label} ${guest ? folderLabel : folder.path}`);
+        input.onchange = () => {
+          state.onlyFolder = null;
+          if (input.checked) {set.add(folder.path); other.delete(folder.path);} else set.delete(folder.path);
+          if (input.checked) for (const checkbox of row.querySelectorAll('input')) if (checkbox !== input) checkbox.checked = false;
+          state.page = 0; syncFolderControls();
+        };
+        tag.append(input, label); row.append(tag);
+      }
+      const label = document.createElement('span'); label.className = 'folder-label'; label.title = guest ? folderLabel : folder.path;
+      label.textContent = `${folderLabel} · ${folder.files} ${folder.files === 1 ? 'file' : 'files'}`;
+      row.append(label); box.append(row);
+      if (folder.path === focusPath) toggle.focus();
+      if (open) append(folder.path, depth + 1);
+    }
+  }
+  append(null, 0);
+  document.getElementById('collapsefolders').disabled = !openFolders.size;
+  syncFolderControls();
+}
+function searchAllFolders() { clearFolderFilters(); renderFolders(); state.page = 0; run(); }
+document.getElementById('searchall').onclick = searchAllFolders;
+document.getElementById('clearfolders').onclick = searchAllFolders;
+document.getElementById('collapsefolders').onclick = () => { openFolders.clear(); renderFolders(); };
 
 function blendAlpha() {
   const v = parseInt(document.getElementById("blend").value || "50", 10);
@@ -598,9 +830,9 @@ function syncBlendInfo() {
   document.getElementById("blendinfo").textContent = `image ${v} · text ${100 - v}`;
 }
 
-function renderIdxKinds(filter) {
+function renderIdxKinds(filter, files) {
   if (!idxKindInit) {
-    state.idxKinds = new Set((filter && filter.length) ? filter : IDX_ALL);
+    state.idxKinds = new Set(indexSettings?.kinds ?? filter ?? ['image']);
     idxKindInit = true;
   }
   const box = document.getElementById("kchips");
@@ -610,7 +842,9 @@ function renderIdxKinds(filter) {
   lab.textContent = "index types:";
   lab.title = "double-click to select all types";
   lab.ondblclick = () => {
+    if (state.wasRunning) return;
     state.idxKinds = new Set(IDX_ALL);
+    saveIndexPreferences({kinds:[...state.idxKinds]});
     box.querySelectorAll(".chip").forEach(c => c.classList.add("on"));
   };
   box.appendChild(lab);
@@ -620,8 +854,10 @@ function renderIdxKinds(filter) {
     el.textContent = KIND_LABEL[k] || k;
     el.title = k;
     el.onclick = () => {
+      if (state.wasRunning) return;
       if (state.idxKinds.has(k)) state.idxKinds.delete(k); else state.idxKinds.add(k);
       el.classList.toggle("on");
+      saveIndexPreferences({kinds:[...state.idxKinds]});
     };
     box.appendChild(el);
   }
@@ -638,38 +874,44 @@ async function run() {
   const niwRaw = parseFloat(document.getElementById("negw").value);
   const niw = Math.min(2, Math.max(0, isNaN(niwRaw) ? 1.0 : niwRaw));
   const status = document.getElementById("status");
-  if (allRoots.length && state.rootsSel.size === 0) {
-    status.innerHTML = '<span class="err">tick at least one "look in" folder above</span>';
-    return;
-  }
-  const useRoots = rootsNarrowed();
   const requestId = ++searchSerial;
   if (searchController) searchController.abort();
+  const kinds = imageOnly() ? ['image'] : [...state.kinds];
+  if (!kinds.length) {
+    render([]);
+    currentPageHasMore = false;
+    renderPager(false);
+    status.textContent = 'Select at least one search file type.';
+    return;
+  }
   searchController = new AbortController();
   const signal = searchController.signal;
   status.textContent = "searching…";
   let data;
   try {
-    if (state.image) {
+    if (state.image || state.negimage) {
       const r = await fetch("/api/search_image", {method: "POST",
         signal,
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(Object.assign({k, kind: imageOnly() ? ["image"] : [...state.kinds], not: nx ? [nx] : [],
+        body: JSON.stringify(Object.assign({k, kind: kinds, not: nx ? [nx] : [],
           not_weight: nw, q: q, wants: wants, combine: combine, img_weight: blendAlpha(),
-          focus: state.focus, focus_strength: Number(document.getElementById("focus_strength").value) / 100,
-          method: document.getElementById("aspect_method").value,
+          focus: state.image ? state.focus : 'original', focus_strength: Number(document.getElementById("focus_strength").value) / 100,
+          method: state.image ? document.getElementById("aspect_method").value : 'baseline',
           neg_image: state.negimage || undefined, neg_image_weight: niw,
-          roots: useRoots ? [...state.rootsSel] : [], offset: state.page * k}, state.image))});
+          roots: [...state.rootsSel], excluded_roots: [...state.skipFolders], only_folder: state.onlyFolder,
+          offset: state.page * k}, state.image))});
       data = await r.json();
     } else {
-      const params = new URLSearchParams({k, kind: [...state.kinds].join(",")});
+      const params = new URLSearchParams({k, kind: kinds.join(",")});
       if (state.page) params.append("o", state.page * k);
       params.append("not_weight", nw);
       if (q) params.append("q", q);
       for (const w of wants) params.append("q", w);
       if (wants.length) params.append("combine", combine);
       if (nx) params.append("not", nx);
-      if (useRoots) for (const r of state.rootsSel) params.append("roots", r);
+      for (const r of state.rootsSel) params.append("roots", r);
+      for (const r of state.skipFolders) params.append("excluded_roots", r);
+      if (state.onlyFolder) params.append("only_folder", state.onlyFolder);
       const r = await fetch("/api/search?" + params, {signal});
       data = await r.json();
     }
@@ -689,7 +931,7 @@ async function run() {
       ? (hasText ? ` for ${desc} + image @${Math.round(blendAlpha() * 100)}%` : " · searching by image")
       : desc ? ` for ${desc}` : "") +
     (nx ? ` · excluding “${nx}” @${nw}` : "") +
-    (state.image && state.negimage ? ` · ignoring image @${niw}` : "") +
+    (state.negimage ? ` · ignoring image @${niw}` : "") +
     (state.image && state.focus !== "original" ? ` · ${data.label || state.focus}` + (data.method === "style_original" ? "" : ` @${document.getElementById("focus_strength").value}%`) : "") +
     (data.seconds != null ? ` · ${data.seconds}s` : "") +
     (data.warning ? " · " + data.warning : "");
@@ -732,8 +974,27 @@ function render(items) {
     const thumb = document.createElement("div");
     thumb.className = "thumb";
     if (r.kind === "image") {
-      thumb.style.backgroundImage = "url('" + r.thumb + "')";
-      thumb.style.backgroundSize = "cover";
+      const preview = document.createElement('img');
+      preview.alt = '';
+      preview.loading = 'lazy';
+      preview.decoding = 'async';
+      let failures = 0;
+      preview.onerror = () => {
+        if (!preview.isConnected) return;
+        if (failures++ === 0 && r.thumb) {
+          const retry = new URL(r.thumb, location.href);
+          retry.searchParams.set('_retry', '1');
+          setTimeout(() => { if (preview.isConnected) preview.src = retry.href; }, 250);
+        } else if (failures <= 2 && r.open) {
+          preview.src = r.open;
+        } else {
+          preview.remove();
+          thumb.classList.add('thumb-unavailable');
+          thumb.textContent = 'Preview unavailable · Click to open';
+        }
+      };
+      preview.src = r.thumb || r.open;
+      thumb.appendChild(preview);
     } else { thumb.textContent = ICON[r.kind] || "📄"; }
     const body = document.createElement("div"); body.className = "body";
     const match = (r.pos != null ? r.pos : r.score) * 100;
@@ -741,9 +1002,10 @@ function render(items) {
       ? ` ${r.penalty < 0 ? "+" : "−"}${Math.abs(r.penalty * 100).toFixed(1)}` : "";
     body.innerHTML = `<div class="kind">${KIND_LABEL[r.kind]||r.kind}</div>
       <div class="name">${escapeHtml(r.rel)}</div>
+      ${guest ? '' : `<div class="result-path">${escapeHtml(r.path)}</div>`}
       <div class="snip">${escapeHtml(r.snippet || r.title || "")}</div>
       <div class="meta"><span>${r.chunks > 1 ? "chunk " + (r.chunk+1) + "/" + r.chunks : ""}</span>
-      <span title="${r.penalty ? `match ${match.toFixed(1)}%, penalty ${pen.trim()}` : "match score"}">${match.toFixed(1)}%${pen}</span></div>`;
+      <span class="result-score" title="${r.penalty ? `match ${match.toFixed(1)}%, penalty ${pen.trim()}` : "match score"}">${match.toFixed(1)}%${pen}</span></div>`;
     a.appendChild(thumb); a.appendChild(body); box.appendChild(a);
   }
 }
@@ -784,6 +1046,8 @@ function openLightbox(r) {
   lbUrl = r.open;
   lbRecord = r;
   document.getElementById("lb-reference").hidden = r.kind !== "image";
+  document.getElementById("lb-negative").hidden = r.kind !== "image";
+  document.getElementById("lb-folder").hidden = r.kind !== "image" || !r.folder;
   const img = document.getElementById("lb-img");
   if (r.kind === "image") {
     img.src = r.open; img.hidden = false;
@@ -792,12 +1056,13 @@ function openLightbox(r) {
     img.hidden = true; img.removeAttribute("src");
     document.getElementById("lb-snip").textContent = r.snippet || r.title || "";
   }
-  document.getElementById("lb-name").textContent = r.rel || r.path || "";
-  document.getElementById("lb-name").title=r.path || r.rel || '';
+  const name = r.rel || (!guest && r.path) || '';
+  document.getElementById("lb-name").textContent = name;
+  document.getElementById("lb-name").title = guest ? name : r.path || name;
   document.getElementById("lb-meta").textContent =
     `${r.kind || "?"} · ${((r.score || 0) * 100).toFixed(1)}%` +
     (r.chunks > 1 ? ` · chunk ${(r.chunk || 0) + 1}/${r.chunks}` : "") +
-    (r.path ? ` · ${r.path}` : "");
+    (!guest && r.path ? ` · ${r.path}` : "");
   document.getElementById("lightbox").hidden = false;
   syncLightboxNavigation();
 }
@@ -826,6 +1091,21 @@ document.getElementById("lb-reference").onclick = () => {
   closeLightbox(); syncFocus(); syncBlendInfo(); state.page = 0;
   window.scrollTo({top: 0}); run();
 };
+document.getElementById('lb-negative').onclick = () => {
+  if (lbRecord?.kind !== 'image') return;
+  state.negimage = {path: lbRecord.path};
+  const preview = document.getElementById('negpreview');
+  preview.src = lbRecord.thumb; preview.hidden = false;
+  document.getElementById('rmneg').hidden = false;
+  document.getElementById('negdropmsg').textContent = `Ignoring: ${lbRecord.rel || lbRecord.path}`;
+  syncNegativeLabel();
+  closeLightbox();
+};
+document.getElementById('lb-folder').onclick = () => {
+  if (lbRecord?.kind !== 'image' || !lbRecord.folder) return;
+  clearFolderFilters(); state.onlyFolder = lbRecord.folder; state.page = 0;
+  closeLightbox(); renderFolders(); window.scrollTo({top: 0}); run();
+};
 document.addEventListener("keydown", e => {
   if(document.getElementById('lightbox').hidden)return;
   if(['Escape','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) {
@@ -848,7 +1128,7 @@ function renderRoots(stats) {
     if(s.index_dir) {
       const label=document.createElement("div");label.textContent=s.root;nm.textContent="";nm.appendChild(label);
       const disk=document.createElement("div");disk.className="rootstorage";
-      disk.textContent=`Separate index · ${((s.size_bytes||0)/1048576).toFixed(1)} MB vectors`;
+      disk.textContent=`Saved index: ${formatBytes(s.index_bytes ?? s.size_bytes)} · Indexed originals: ${formatBytes(s.source_bytes)}`;
       disk.title=s.index_dir;nm.appendChild(disk);
     }
     const ct = document.createElement("span");
@@ -856,11 +1136,14 @@ function renderRoots(stats) {
     ct.textContent = `${(s.files ?? "?")} files · ${(s.vectors ?? "?")} vectors`;
     const update=document.createElement("button");update.className="ghost updateroot";update.textContent="Update";
     update.title="Scan and update only this folder";update.onclick=()=>{showTab("library");startIdx([s.root],false,true);};
+    const verify=document.createElement('button');verify.className='ghost verifyroot';verify.textContent='Verify file contents';
+    verify.title='Read and hash every file. Older records without hashes may be re-embedded on the first verification.';
+    verify.onclick=()=>{showTab('library');startIdx([s.root],false,true,true);};
     const rm = document.createElement("button");
     rm.className = "danger rmroot"; rm.textContent = "Remove";
     rm.title = "Remove this folder's files from the index";
     rm.onclick = () => forgetRoot(s.root);
-    row.appendChild(nm); row.appendChild(ct); row.appendChild(update); row.appendChild(rm);
+    row.appendChild(nm); row.appendChild(ct); row.appendChild(update); row.appendChild(verify); row.appendChild(rm);
     box.appendChild(row);
   }
 }
@@ -986,6 +1269,10 @@ document.getElementById("imagefile").onchange = async e => {
 };
 document.getElementById("blend").oninput = syncBlendInfo;
 
+function syncNegativeLabel() {
+  document.getElementById('refine_label').textContent = state.negimage
+    ? 'Refine search · negative image active' : 'Refine search · extra terms & exclusions';
+}
 function setNegImage(f, dataUrl) {
   const m = /^data:([^;,]+)?;base64,([\s\S]*)$/.exec(dataUrl || "");
   if (!m) {
@@ -998,6 +1285,7 @@ function setNegImage(f, dataUrl) {
   document.getElementById("rmneg").hidden = false;
   document.getElementById("negdropmsg").textContent =
     `ignoring: ${f.name} (${(f.size / 1048576).toFixed(1)} MB)`;
+  syncNegativeLabel();
   return true;
 }
 function clearNegImage() {
@@ -1006,6 +1294,7 @@ function clearNegImage() {
   prev.hidden = true; prev.removeAttribute("src");
   document.getElementById("rmneg").hidden = true;
   document.getElementById("negdropmsg").textContent = "Drop an image here to ignore its look (optional)";
+  syncNegativeLabel();
 }
 const dropneg = document.getElementById("dropneg");
 ["dragenter","dragover"].forEach(ev => dropneg.addEventListener(ev, e => {
@@ -1050,13 +1339,68 @@ function idxSet(text, err) {
   el.innerHTML = err ? '<span class="err">' + escapeHtml(text) + "</span>" : escapeHtml(text);
 }
 function idxBusy(on) {
-  for (const id of ["doidx", "reidx"]) document.getElementById(id).disabled = on;
-  document.querySelectorAll(".rmroot,.updateroot").forEach(b => { b.disabled = on; });
+  for (const id of ["doidx", "reidx", "cleanupindex"]) document.getElementById(id).disabled = on;
+  document.querySelectorAll(".rmroot,.updateroot,.verifyroot").forEach(b => { b.disabled = on; });
   document.getElementById("library_badge").textContent=on ? "Indexing…" : "";
   document.getElementById("cancelb").hidden = !on;
+  document.getElementById('indexdim').disabled = on || !indexSettings || indexSettings.locked;
+  document.getElementById('prepareworkers').disabled = on;
 }
-async function startIdx(folders, rescan, onlyThisFolder=false) {
-  if (idxKindInit && state.idxKinds.size === 0) {
+function formatBytes(value) {
+  if (!Number.isFinite(value)) return 'unknown';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (value >= 1000 && i < units.length - 1) { value /= 1000; i++; }
+  return `${value.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+function renderCleanup(report) {
+  const line = document.getElementById('cleanupresult');
+  if (!report) { line.textContent = 'Refseek keeps the active index and one recovery copy.'; return; }
+  if (report.error) { line.textContent = `Cleanup failed: ${report.error}`; return; }
+  line.textContent = report.removed || report.freed_bytes || report.failed
+    ? `Last cleanup removed ${report.removed} old snapshots and freed ${formatBytes(report.freed_bytes)}.` +
+      (report.failed ? ` ${report.failed} could not be fully removed.` : '')
+    : 'Last cleanup found no old snapshots to remove.';
+}
+document.getElementById('cleanupindex').onclick = async event => {
+  const button = event.currentTarget; button.disabled = true;
+  document.getElementById('cleanupresult').textContent = 'Checking the active and recovery indexes…';
+  try { renderCleanup(await (await fetch('/api/cleanup_snapshots',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json()); }
+  catch (error) { renderCleanup({error:String(error)}); }
+  finally { button.disabled = state.wasRunning; }
+};
+async function showIndexDetails() {
+  const box = document.getElementById('indexreport');
+  box.textContent = 'Loading indexing report…';
+  try {
+    const report = await (await fetch('/api/index_report')).json();
+    if (report.error) { box.textContent = report.error; return; }
+    box.textContent = `Last scan ${report.cancelled ? 'cancelled' : 'finished'} in ${fmtElapsed(report.seconds)} · ${report.indexed_files} indexed · ${report.unchanged} reused · ${report.dropped} removed from the index.`;
+    if (report.warnings?.length) {
+      const details = document.createElement('details'), heading = document.createElement('summary');
+      heading.textContent = `Warnings (${report.warnings.length})`; details.append(heading);
+      const list = document.createElement('ul');
+      for (const [path, warning] of report.warnings) {
+        const item = document.createElement('li'); item.textContent = `${path} · ${warning}`; list.append(item);
+      }
+      details.append(list); box.append(details);
+    }
+  } catch (error) { box.textContent = String(error); }
+}
+document.getElementById('indexdetails').onclick = event => {
+  const box = document.getElementById('indexreport'); box.hidden = !box.hidden;
+  event.currentTarget.textContent = box.hidden ? 'Show latest indexing details' : 'Hide latest indexing details';
+  if (!box.hidden) showIndexDetails();
+};
+async function startIdx(folders, rescan, onlyThisFolder=false, verifyContents=false) {
+  await indexPreferenceSave;
+  if (indexPreferenceError) await saveIndexPreferences({kinds:[...state.idxKinds],prepare_workers:Number(document.getElementById('prepareworkers').value)});
+  if (indexPreferenceError) {idxSet('Could not save indexing preferences: ' + indexPreferenceError,true);return;}
+  if (!idxKindInit) {
+    idxSet('Wait for the library to load before indexing.', true);
+    return;
+  }
+  if (state.idxKinds.size === 0) {
     idxSet("tick at least one file type under 'index types' (double-click the label for all)", true);
     return;
   }
@@ -1065,7 +1409,7 @@ async function startIdx(folders, rescan, onlyThisFolder=false) {
     const r = await fetch("/api/index", {method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({folders: folders, media: "auto", rescan: also,
-        kinds: idxKindInit ? [...state.idxKinds] : undefined})});
+        kinds: [...state.idxKinds], verify_contents:verifyContents})});
     const d = await r.json();
     if (d.error) { idxSet(d.error, true); return; }
     idxBusy(true);
@@ -1089,13 +1433,17 @@ async function pollJob() {
     track.style.display = "block";
     track.classList.toggle("indet", pct === null);
     if (pct !== null) fill.style.width = pct + "%";
-    const names = (d.folders || []).map(f => f.split("/").filter(Boolean).pop()).join(", ");
+    const names = (d.folders || []).map(f => f.split(/[\\/]/).filter(Boolean).pop()).join(", ");
     let line = "indexing " + names;
     if (d.stage === "embedding" && d.progress) line += " — " + d.progress.trim();
     else if (d.stage === "scanning") line += " — scanning folders…";
     else if (d.stage === "preparing") line += " — reading files, building chunks…";
     else line += d.progress ? " — " + d.progress.trim() : " — starting…";
-    if (d.started) line += " · elapsed " + fmtElapsed(Date.now() / 1000 - d.started);
+    if (d.started) {
+      const elapsed = Date.now() / 1000 - d.started;
+      line += ' · elapsed ' + fmtElapsed(elapsed);
+      if (d.stage === 'embedding' && d.files_done > 0 && elapsed > 0) line += ` · ${(d.files_done / elapsed).toFixed(1)} files/s overall`;
+    }
     idxSet(line, false);
     if (!state.jobTimer) state.jobTimer = setInterval(pollJob, 1200);
     return;
@@ -1116,10 +1464,12 @@ async function pollJob() {
       `${r.unchanged} unchanged · ${r.dropped} removed · ${r.total} total in ${r.seconds}s`;
     if (r.vectors_added && r.seconds) msg += ` · ${(r.vectors_added / r.seconds).toFixed(1)} vec/s`;
     if (r.kinds_excluded) msg += ` · ${r.kinds_excluded} files skipped by type filter`;
+    if (r.warnings?.length) msg += " · " + r.warnings.join("; ");
     if (r.skipped_reasons && r.skipped_reasons.length)
       msg += " · skipped: " + r.skipped_reasons.map(x => x.count + " x " + x.why).join(", ");
     if (r.api_errors && r.api_errors.length) msg += " · api errors: " + r.api_errors.length;
     idxSet(msg, false);
+    if (!document.getElementById('indexreport').hidden) showIndexDetails();
   }
   boot();
 }
@@ -1140,10 +1490,12 @@ document.getElementById("cancelb").onclick = async () => {
   try {
     const d = await (await fetch("/api/cancel", {method: "POST"})).json();
     if (d.error) { idxSet(d.error, true); return; }
-    idxSet("cancelling — finishing the current batch, embedded work stays saved…", false);
+    idxSet("cancelling — stopping queued work; completed files stay saved…", false);
   } catch (e) { idxSet("request failed: " + e, true); }
 };
 
+renderSearchKinds();
+syncFocus();
 boot();
 </script>
 </body>
@@ -1522,6 +1874,7 @@ boot();
 </html>
 """
 
+_FILE_RE = re.compile(r"indexing (\d+)/(\d+) files \((\d+)%\) · ([\d.]+) files/s · ETA (\S+)")
 _EMB_RE = re.compile(r"embedding (\d+)/(\d+) items \((\d+)%\), (\d+)/(\d+) files · ([\d.]+) items/s · ETA (\S+)")
 
 
@@ -1548,6 +1901,10 @@ class _JobStream:
             job["files_done"], job["files_total"] = int(m.group(4)), int(m.group(5))
             job["rate"] = float(m.group(6))
             job["eta"] = m.group(7)
+        elif (files := _FILE_RE.search(s)):
+            job.update(stage='embedding', done=int(files[1]), items_total=int(files[2]), pct=int(files[3]),
+                       files_done=int(files[1]), files_total=int(files[2]), rate=float(files[4]), eta=files[5])
+            m = files
         elif s.startswith("scanning"):
             job["stage"] = "scanning"
         elif s.startswith("preparing") or s.startswith("prepared"):
@@ -1602,6 +1959,22 @@ def _job_view():
     return view
 
 
+def _save_report(data_dir, name, report):
+    from .store import _atomic_write
+    root = Path(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write(root / name, json.dumps(report, ensure_ascii=False).encode('utf-8'))
+
+
+def _read_report(data_dir, name, missing=None):
+    try:
+        return json.loads((Path(data_dir) / name).read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return missing
+    except (OSError, ValueError) as exc:
+        return {'error': str(exc)}
+
+
 def _index_worker(job, settings, client):
     orig = sys.stdout
     stream = _JobStream(job, console=orig)
@@ -1618,7 +1991,8 @@ def _index_worker(job, settings, client):
         res = Indexer(settings, client, log=stream).run(job["folders"], media=job["media"],
                                                         kinds=job.get("kinds"),
                                                         rescan=job.get("rescan", False),
-                                                        cancel=lambda: bool(job.get("cancel")))
+                                                        cancel=lambda: bool(job.get("cancel")),
+                                                        verify_contents=job.get("verify_contents",False))
         reasons = {}
         for _p, why in (res.get("skipped") or []):
             k = str(why)[:80]
@@ -1636,9 +2010,23 @@ def _index_worker(job, settings, client):
             "skipped_reasons": [{"count": n, "why": w} for w, n in
                                 sorted(reasons.items(), key=lambda x: -x[1])[:5]],
             "api_errors": [str(e)[:200] for e in (res.get("errors") or [])[:3]],
+            "warnings": list(res.get('warnings', [])),
+            "preparation_workers": res.get('preparation_workers'),
+            "embedding_requests": res.get('embedding_requests'),
+            "checkpoints": res.get('checkpoints'),
+            "verify_contents": res.get('verify_contents', False),
         }
+        try:
+            _save_report(settings.data_dir, 'last-index.json', dict(job['result'],
+                         warnings=[(str(path), str(reason)) for path, reason in res.get('skipped', [])] + [('Recovery', str(w)) for w in res.get('warnings', [])]))
+        except OSError as exc:
+            job['result']['report_error'] = str(exc)
     except Exception as e:
         job["error"] = f"{type(e).__name__}: {e}"
+        try:
+            _save_report(settings.data_dir, 'last-index.json', {'error': job['error']})
+        except OSError:
+            pass
         if os.environ.get("EG_DEBUG"):
             traceback.print_exc()
     finally:
@@ -1664,10 +2052,17 @@ def _index_worker(job, settings, client):
                 pass
 
 
-def _start_index_job(settings, client, folders, media, kinds=None, rescan=False):
+def _start_index_job(settings, client, folders, media, kinds=None, rescan=False, verify_contents=False):
     with _JOB_LOCK:
         if _JOB.get("running"):
             return None, "indexing already running — wait for the current one to finish"
+        try:
+            existing_index = Index.load(settings.data_dir)
+        except Exception as exc:
+            return None, 'Cannot load the library: ' + str(exc)
+        from .index_preferences import load, save
+        if kinds is None:
+            kinds = load(settings.data_dir, fallback_kinds=existing_index.kind_filter or ['image'], fallback_workers=settings.threads)['kinds']
         kind_list = None
         if kinds is not None:
             if isinstance(kinds, str):
@@ -1697,10 +2092,7 @@ def _start_index_job(settings, client, folders, media, kinds=None, rescan=False)
                 return None, f"folder not found: {p}"
             if str(p) not in targets:
                 targets.append(str(p))
-        try:
-            existing = Index.load(settings.data_dir).roots or []
-        except Exception:
-            existing = []
+        existing = existing_index.roots or []
         extra = [str(r) for r in existing] if rescan else []
         all_folders = list(dict.fromkeys(targets + extra))
         if not all_folders:
@@ -1708,8 +2100,13 @@ def _start_index_job(settings, client, folders, media, kinds=None, rescan=False)
                 all_folders = [str(r) for r in existing]
             else:
                 return None, "no folders to index — type a folder path first"
+        try:
+            save(settings.data_dir, kinds=list(INDEX_KINDS) if kind_list==['all'] else kind_list,
+                 prepare_workers=settings.threads)
+        except (OSError, ValueError) as exc:
+            return None, 'Could not save indexing preferences: ' + str(exc)
         job = {"running": True, "folders": all_folders, "media": media, "kinds": kind_list,
-               "rescan": bool(rescan), "cancel": False,
+               "rescan": bool(rescan), "verify_contents":bool(verify_contents), "cancel": False,
                "progress": "", "error": None, "result": None, "started": time.time(), "finished": None}
         _JOB.clear()
         _JOB.update(job)
@@ -1718,9 +2115,15 @@ def _start_index_job(settings, client, folders, media, kinds=None, rescan=False)
 
 
 def _norm_roots(raw):
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (tuple, list)):
+        return None
     out = []
     for r in raw or []:
-        r = str(r).strip()
+        if not isinstance(r, str):
+            continue
+        r = r.strip()
         if not r:
             continue
         try:
@@ -1730,34 +2133,45 @@ def _norm_roots(raw):
     return out or None
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(AccountHTTP, BaseHTTPRequestHandler):
     server_version = "EmbeddingGemmaSearch/1.0"
     settings: Settings = None
     client: EmbedClient = None
     _cache = {"stamp": None, "index": None, "paths": set()}
 
     def index(self) -> Index:
+        if self.guest:
+            grants = self.account.folders
+            with self._cache['guest_lock']:
+                key = (Index.stamp(self.settings.data_dir), grants)
+                views = self._cache.setdefault('guest_views', {})
+                view = views.get(key)
+                if view is None:
+                    base = Index.load(self.settings.data_dir, roots=grants) if grants else Index(self.settings.data_dir)
+                    view = guest_index(base, grants, self.settings_root)
+                    if len(views) >= 4:
+                        views.clear()
+                    views[key] = view
+                return view
         stamp = Index.stamp(self.settings.data_dir)
         if self._cache["index"] is None or stamp != self._cache["stamp"]:
             index = Index.load(self.settings.data_dir)
-            self._cache["stamp"] = stamp
-            self._cache["index"] = index
-            self._cache["paths"] = {r.get("path") for r in index.records}
-            self._cache["views"] = {}
+            self._cache.update(stamp=stamp, index=index, paths={r.get('path') for r in index.records}, views={})
         return self._cache["index"]
 
     def search_index(self,roots):
-        if not roots:return self.index()
+        if self.guest or not roots:return self.index()
         # Only requested shards are read for a scoped query. Keep a small set
         # of stable view objects so style projection caches remain reusable.
         stamp=Index.stamp(self.settings.data_dir)
         views=self._cache.setdefault('views',{})
         key=(stamp,tuple(sorted(roots)))
-        if key not in views:
+        value = views.get(key)
+        if value is None:
             value=Index.load(self.settings.data_dir,roots=roots)
             if len(views)>=4:views.clear()
             views[key]=value
-        return views[key]
+        return value
 
     def log_message(self, fmt, *args):
         if self.settings and os.environ.get("EG_QUIET"):
@@ -1783,6 +2197,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.accounts.enabled:
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
+            self.send_header('Referrer-Policy', 'no-referrer')
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1797,13 +2216,16 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         query = urllib.parse.parse_qs(url.query)
         try:
+            if not self.authorize(path):
+                return
+            if self.accounts.enabled and path in ('/login', '/users', '/api/users'):
+                return self.account_get(path)
             if path in ("/", "/index.html"):
-                return self._send(200, PAGE, "text/html; charset=utf-8")
+                return self.html(PAGE)
             if path == "/match":
-                return self._send(200, MATCH_PAGE, "text/html; charset=utf-8")
+                return self.html(MATCH_PAGE)
             if path == "/focus":
-                return self._send(200, Path(__file__).with_name("focus.html").read_text(encoding="utf-8"),
-                                  "text/html; charset=utf-8")
+                return self.html(Path(__file__).with_name("focus.html").read_text(encoding="utf-8"))
             if path == "/research":
                 return self._send(200, Path(__file__).resolve().parent.parent.joinpath("research", "report.html").read_text(encoding="utf-8"),
                                   "text/html; charset=utf-8")
@@ -1811,7 +2233,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, Path(__file__).resolve().parent.parent.joinpath("style-models", "report.html").read_text(encoding="utf-8"),
                                   "text/html; charset=utf-8")
             if path == "/api/style_models":
-                return self._json(self.focus_engine.style_status())
+                status = self.focus_engine.style_status()
+                if self.guest:
+                    status = {key: status[key] for key in ('available', 'default_method') if key in status}
+                return self._json(status)
             if path == "/api/focus_examples":
                 index = self.index()
                 hits = Searcher(self.settings, self.client).search(
@@ -1833,18 +2258,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"roots": index.roots})
             if path == "/api/job":
                 return self._json(_job_view())
+            if path == "/api/index_report":
+                return self._json(_read_report(self.settings.data_dir, 'last-index.json',
+                                               {'error': 'No indexing report yet. Add or update a folder to create one.'}))
             return self._json({"error": "not found"}, 404)
         except BrokenPipeError:
             pass
         except Exception as e:
             if os.environ.get("EG_DEBUG"):
                 traceback.print_exc()
-            return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+            private_error = self.accounts.enabled and (self.account is None or self.guest)
+            return self._json({"error": 'Refseek could not complete the request.' if private_error else f"{type(e).__name__}: {e}"}, 500)
 
     def do_POST(self):
         self._t0 = time.time()
         url = urllib.parse.urlparse(self.path)
         try:
+            if not self.authorize(url.path, post=True):
+                return
+            if self.accounts.enabled and url.path in ('/api/login', '/api/logout', '/api/users', '/api/users/remove'):
+                return self.account_post(url.path)
             if url.path == "/api/focus":
                 length = int(self.headers.get("Content-Length") or 0)
                 if length <= 0 or length > 36 * 1048576:
@@ -1876,15 +2309,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._forget(payload)
             if url.path == "/api/cancel":
                 return self._cancel()
+            if url.path in ("/api/cleanup_snapshots", "/api/index_settings") and self.headers.get_content_type() != 'application/json':
+                return self._json({'error': 'Send an application/json request.'}, 415)
+            if url.path == "/api/cleanup_snapshots":
+                return self._cleanup_snapshots()
+            if url.path == "/api/index_settings":
+                length = int(self.headers.get('Content-Length') or 0)
+                if not 0 < length <= 1024:
+                    return self._json({'error': 'Invalid settings request.'}, 400)
+                return self._set_index_settings(json.loads(self.rfile.read(length)))
             return self._json({"error": "not found"}, 404)
         except Exception as e:
             if os.environ.get("EG_DEBUG"):
                 traceback.print_exc()
-            return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+            private_error = self.accounts.enabled and (self.account is None or self.guest)
+            return self._json({"error": 'Refseek could not complete the request.' if private_error else f"{type(e).__name__}: {e}"}, 500)
 
     def _status(self):
         from . import __version__
         from .store import CorruptIndexError
+
+        if self.guest:
+            index = self.index()
+            info = index.stats()
+            return {key: info[key] for key in ('files', 'kinds', 'roots')} | {'folder_tree': index.folder_tree}
 
         try:
             index = self.index()
@@ -1904,6 +2352,9 @@ class Handler(BaseHTTPRequestHandler):
                 "roots": index.roots, "kind_filter": index.kind_filter, "kinds": {},
                 "data_dir": str(Path(self.settings.data_dir).expanduser().resolve()),
                 "root_stats": self._root_stats(index),
+                "folder_tree": index.folder_tree,
+                "last_cleanup": _read_report(self.settings.data_dir, 'last-cleanup.json'),
+                "index_settings": self._index_settings(index),
                 "storage": index.storage_info(),
                 "app_version": __version__}
         for r in index.records:
@@ -1917,11 +2368,67 @@ class Handler(BaseHTTPRequestHandler):
         info['runtime'] = getattr(self.settings,'runtime_info',None)
         return info
 
+    def _index_settings(self, index):
+        from .dimensions import DEFAULT_DIMENSION, DIMENSIONS, preferred_dimension
+
+        dimension = (index.search_dim or index.dim) if index.records else preferred_dimension(self.settings.data_dir)
+        from .index_preferences import load, cpu_limit
+        saved = load(self.settings.data_dir, fallback_kinds=index.kind_filter or ['image'], fallback_workers=self.settings.threads)
+        return dict(dimension=dimension or DEFAULT_DIMENSION, locked=bool(index.records), choices=DIMENSIONS,
+                    kinds=saved['kinds'], prepare_workers=self.settings.threads, max_prepare_workers=cpu_limit(),
+                    estimates=[dict(dimension=d, native_bytes=0 if d == DEFAULT_DIMENSION else 4 * 10000 * DEFAULT_DIMENSION,
+                                    total_bytes=4 * 10000 * (d if d == DEFAULT_DIMENSION else d + DEFAULT_DIMENSION))
+                               for d in DIMENSIONS])
+
+    def _set_index_settings(self, payload):
+        from .dimensions import DIMENSIONS
+        from .index_preferences import save, cpu_limit
+        if not isinstance(payload, dict) or not payload or set(payload)-{'dimension','kinds','prepare_workers'}:
+            return self._json({'error':'Invalid indexing preferences.'}, 400)
+        dimension = payload.get('dimension')
+        if 'dimension' in payload and (type(dimension) is not int or dimension not in DIMENSIONS):
+            return self._json({'error':'Choose 768, 512, 256 or 128 dimensions.'}, 400)
+        kinds = payload.get('kinds')
+        if 'kinds' in payload and (not isinstance(kinds,list) or any(not isinstance(k,str) or k not in INDEX_KINDS for k in kinds)):
+            return self._json({'error':'Choose known file types.'}, 400)
+        workers = payload.get('prepare_workers')
+        if 'prepare_workers' in payload and (type(workers) is not int or not 1 <= workers <= cpu_limit()):
+            return self._json({'error':f'Choose 1 through {cpu_limit()} CPU preparation workers.'}, 400)
+        with _JOB_LOCK:
+            if _JOB.get('running'):
+                return self._json({'error':'Wait for indexing to finish.'}, 409)
+            index = self.index()
+            if dimension is not None and index.records:
+                return self._json({'error':'This library keeps its existing dimensions.'}, 409)
+            if 'kinds' in payload or 'prepare_workers' in payload:
+                current = self._index_settings(index)
+                save(self.settings.data_dir, kinds=kinds if 'kinds' in payload else current['kinds'],
+                     prepare_workers=workers if workers is not None else self.settings.threads)
+                if workers is not None:
+                    self.settings.threads = workers
+            if dimension is not None:
+                _save_report(self.settings.data_dir,'search-settings.json',{'dimension':dimension})
+            return self._json(self._index_settings(index))
+
+    def _cleanup_snapshots(self):
+        from .folder_store import cleanup
+        from .store import CorruptIndexError
+
+        with _JOB_LOCK:
+            if _JOB.get('running'):
+                return self._json({'error': 'Wait for indexing to finish before cleaning up.'}, 409)
+            try:
+                report = cleanup(self.settings.data_dir)
+            except (CorruptIndexError, OSError, RuntimeError) as exc:
+                report = {'error': str(exc)}
+            _save_report(self.settings.data_dir, 'last-cleanup.json', report)
+        return self._json(report, 409 if 'error' in report else 200)
+
     def _root_stats(self, index):
         import os as _os
 
         roots = index.roots or []
-        files = [set() for _ in roots]
+        files = [{} for _ in roots]
         vecs = [0] * len(roots)
         for r in index.records:
             p = r.get("path") or ""
@@ -1931,16 +2438,22 @@ class Handler(BaseHTTPRequestHandler):
                     if best < 0 or len(root) > len(roots[best]):
                         best = i
             if best >= 0:
-                files[best].add(p)
+                files[best][p] = r.get('size') or 0
                 vecs[best] += 1
         storage={entry['root']:entry for entry in index.storage_info()['indexes']}
-        return [dict(storage.get(root,{}),root=root,files=len(files[i]),vectors=vecs[i])
+        return [dict(storage.get(root,{}),root=root,files=len(files[i]),vectors=vecs[i],source_bytes=sum(files[i].values()))
                 for i, root in enumerate(roots)]
 
     def _indexed(self, path: str):
+        if self.guest:
+            view = self.index()
+            return allowed_file(path, tuple(Path(p) for p in self.account.folders), self.settings_root) if path in view._allowed_paths else None
         try:
             target = str(Path(path).resolve())
         except Exception:
+            return None
+        self.index()
+        if self.accounts.enabled and Path(target).is_relative_to(self.settings_root):
             return None
         return target if target in self._cache["paths"] else None
 
@@ -1966,19 +2479,37 @@ class Handler(BaseHTTPRequestHandler):
                 shrunk = None
             if shrunk is not None:
                 data, ctype = shrunk
+        if self.accounts.enabled:
+            safe_image = ctype in ('image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'image/tiff')
+            disp = 'inline' if inline and safe_image else 'attachment'
+            name = urllib.parse.quote(Path(target).name, safe='')
+            return self._send(200, data, ctype, {'Content-Disposition': f"{disp}; filename*=UTF-8''{name}",
+                                               'Content-Security-Policy': "sandbox; default-src 'none'"})
         disp = "inline" if inline else "attachment"
-        return self._send(200, data, ctype, {"Content-Disposition": f'{disp}; filename="{Path(target).name}"'})
+        name = urllib.parse.quote(Path(target).name, safe='')
+        return self._send(200, data, ctype, {'Content-Disposition': f"{disp}; filename*=UTF-8''{name}"})
 
     def _search(self, query, payload):
         from .store import CorruptIndexError
+        from .folder_scope import FolderScope
 
+        raw = query if payload is None else payload
+        if self.guest and (payload or {}).get('method') not in (None, 'baseline', 'style_original', 'style_current', 'style_contrastive'):
+            return self._json({'error': 'This method is available to the owner only.'}, 403)
+        roots = _norm_roots(raw.get('roots'))
+        excluded = _norm_roots(raw.get('excluded_roots'))
+        exact = _norm_roots(raw.get('only_folder'))
+        scope = FolderScope(roots, excluded, exact[0] if exact else None)
+        neg = (payload or {}).get('neg_image') or {}
         try:
-            selected_roots=_norm_roots(query.get('roots',[]) if not payload else (payload.get('roots') or []))
-            index = self.index() if (payload or {}).get('path') else self.search_index(selected_roots)
+            needs_reference = (payload or {}).get('path') or (isinstance(neg, dict) and neg.get('path'))
+            index = self.index() if needs_reference else self.search_index(scope.candidate_roots)
         except CorruptIndexError as e:
+            if self.guest:
+                return self._json({'error': 'The shared index is unavailable.'}, 503)
             return self._json({"error": f"index unreadable: {e} — run: python run.py doctor"})
         if not index.records:
-            if selected_roots:return self._json({"results":[],"more":False,"count":0})
+            if self.guest or scope.candidate_roots:return self._json({"results":[],"more":False,"count":0})
             return self._json({"error": "index is empty — run: python run.py index <folder>"})
         searcher = Searcher(self.settings, self.client)
         raw_k = query.get("k") or (payload or {}).get("k") or [24]
@@ -2003,8 +2534,6 @@ class Handler(BaseHTTPRequestHandler):
         combine = query.get("combine", ["avg"])[0] if not payload else (payload.get("combine") or "avg")
         if combine not in ("avg", "max"):
             combine = "avg"
-        raw_roots = (query.get("roots", []) if not payload else (payload.get("roots") or []))
-        roots = _norm_roots(raw_roots)
         focus = (payload or {}).get("focus", "original")
         from .focus import FOCUS_GROUPS
         if focus not in ("original", "subject", *FOCUS_GROUPS):
@@ -2014,7 +2543,25 @@ class Handler(BaseHTTPRequestHandler):
         use_focus = focus != "original" and (payload or {}).get("focus_strength", 1) != 0
         if payload and (use_focus or payload.get("path") or payload.get("method") == "style_original"):
             try:
-                return self._json(self.focus_engine.search_gallery(payload, index, roots=roots, k=k, offset=offset))
+                response = self.focus_engine.search_gallery(payload, index, scope=scope, k=k, offset=offset)
+                for row in response['results']:
+                    row['folder'] = str(Path(row['path']).parent)
+                return self._json(response)
+            except (TypeError, ValueError) as e:
+                return self._json({"error": str(e)}, 400)
+        try:
+            niw = min(2.0, max(0.0, float((payload or {}).get('neg_image_weight', 1.0))))
+        except (TypeError, ValueError):
+            niw = 1.0
+        neg_vector = None
+        if neg and niw:
+            try:
+                if isinstance(neg, dict) and neg.get('path'):
+                    neg_vector = index.image_vector_at(neg['path'])
+                    if neg_vector is None:
+                        raise ValueError('negative image is no longer in this index')
+                else:
+                    neg_vector = self.focus_engine.image_vector(neg)
             except (TypeError, ValueError) as e:
                 return self._json({"error": str(e)}, 400)
         if payload and payload.get("base64"):
@@ -2027,21 +2574,6 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError) as e:
                 return self._json({"error": str(e)}, 400)
             mime = payload.get("mime") or "image/png"
-            neg_blob, neg_mime = None, "image/png"
-            ni = payload.get("neg_image") or {}
-            if isinstance(ni, dict) and ni.get("base64"):
-                try:
-                    neg_blob = base64.b64decode(ni["base64"])
-                    if len(neg_blob) > 25 * 1048576:
-                        return self._json({"error": "ignore-image too large (max 25 MB)"}, 400)
-                    neg_mime = ni.get("mime") or "image/png"
-                except Exception:
-                    return self._json({"error": "unreadable ignore-image"}, 400)
-            raw_niw = payload.get("neg_image_weight", 1.0)
-            try:
-                niw = min(2.0, max(0.0, float(raw_niw)))
-            except (TypeError, ValueError):
-                niw = 1.0
             q = payload.get("q", "")
             if isinstance(q, str):
                 q = [q]
@@ -2055,24 +2587,26 @@ class Handler(BaseHTTPRequestHandler):
                                       wants=img_wants + extra,
                                       combine=(payload.get("combine") or "avg"),
                                       image_bytes=blob, image_mime=mime, img_weight=iw,
-                                      neg_image_bytes=neg_blob, neg_image_mime=neg_mime,
+                                      neg_image_vector=neg_vector,
                                       neg_image_weight=niw,
-                                      neg_weight=neg_weight, roots=roots, offset=offset)
+                                      neg_weight=neg_weight, scope=scope, offset=offset)
         else:
             q = query.get("q", []) if not payload else payload.get("q", "")
             if isinstance(q, str):
                 q = [q]
             wants = [x.strip() for x in q if x and x.strip()]
+            wants += [x.strip() for x in (payload or {}).get('wants', []) if x and x.strip()]
             if not wants:
                 return self._json({"error": "empty query"})
             results = searcher.search(k=k + 1, kind=kindstr, index=index, exclude=excludes,
-                                      wants=wants, combine=combine, roots=roots, offset=offset,
-                                      neg_weight=neg_weight)
+                                      wants=wants, combine=combine, scope=scope, offset=offset,
+                                      neg_weight=neg_weight, neg_image_vector=neg_vector, neg_image_weight=niw)
         more = len(results) > k
         results = results[:k]
         for r in results:
             r["thumb"] = "/thumb?path=" + urllib.parse.quote(r.get("path", ""))
             r["open"] = "/file?path=" + urllib.parse.quote(r.get("path", ""))
+            r["folder"] = str(Path(r["path"]).parent)
         response = {"results": results, "more": more}
         if focus != "original":
             response.update(focus=focus, label="Subject" if focus == "subject" else FOCUS_GROUPS[focus]["label"])
@@ -2183,7 +2717,7 @@ class Handler(BaseHTTPRequestHandler):
             media = "auto"
         job, error = _start_index_job(self.settings, self.client,
                                       [str(f) for f in folders if str(f).strip()], media,
-                                      payload.get("kinds"), bool(payload.get("rescan")))
+                                      payload.get("kinds"), bool(payload.get("rescan")), bool(payload.get("verify_contents")))
         if error:
             return self._json({"error": error},
                               409 if "already running" in error else 400)
@@ -2253,34 +2787,76 @@ class _LocalHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-def build_server(settings: Settings, client: EmbedClient, port: int | None = None):
+def build_server(settings: Settings, client: EmbedClient, port: int | None = None, *, accounts_mode: bool | None = None):
+    from .accounts import TUNNEL_HOST, parse_tunnel_host
     from .folder_store import migrate
-    migrate(settings.data_dir)
     from .focus import FocusEngine
-
-    handler = type("BoundHandler", (Handler,), {"settings": settings, "client": client})
-    handler._cache = {"stamp": None, "index": None, "paths": set()}
-    handler.focus_engine = FocusEngine(settings, client)
-    bind_port = settings.web_port if port is None else port
-    server = _LocalHTTPServer((settings.web_host, bind_port), handler)
-    server.daemon_threads = True
     from .store import CorruptIndexError
 
+    root = Path(settings.data_dir).expanduser().absolute()
+    from .index_preferences import load as load_index_preferences, cpu_limit
+    if 'EG_THREADS' not in os.environ:
+        settings.threads = load_index_preferences(root, fallback_workers=settings.threads)['prepare_workers']
+    settings.threads = max(1, min(settings.threads, cpu_limit()))
+    accounts = Accounts(root, enabled=accounts_mode)
+    config = read_env(env_path(root))
+    network = config if accounts.enabled else {}
+    host = network.get('REFSEEK_BIND_HOST', settings.web_host).strip()
+    public_host = network.get('REFSEEK_PUBLIC_HOST', host).strip().lower()
+    cert, key = network.get('REFSEEK_TLS_CERT', '').strip(), network.get('REFSEEK_TLS_KEY', '').strip()
+    tunnel_host = parse_tunnel_host(network.get(TUNNEL_HOST, ''))
+    local = host in ('127.0.0.1', 'localhost')
+    tls = bool(cert or key)
+    if tls and not (cert and key):
+        raise ValueError('Configure both REFSEEK_TLS_CERT and REFSEEK_TLS_KEY.')
+    if not local and not (accounts.enabled and tls):
+        raise ValueError('Network access requires enabled accounts and an HTTPS certificate and key.')
+    if tunnel_host and not local:
+        raise ValueError('A Cloudflare Tunnel requires Refseek to listen on 127.0.0.1 or localhost.')
+    if accounts.enabled and (not re.fullmatch(r'[a-z0-9][a-z0-9.\-]*', public_host) or public_host == '0.0.0.0'):
+        raise ValueError('Set REFSEEK_PUBLIC_HOST to the server name or LAN address.')
+    context = None
+    if tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(config_file(root, cert), config_file(root, key))
+    stamp = Index.stamp(settings.data_dir)
     try:
-        index = handler._cache["index"] or Index.load(settings.data_dir)
+        index = migrate(settings.data_dir)
     except CorruptIndexError:
         index = None
+    if index and index.records and index.dim:
+        settings.dim = index.dim
+
+    handler = type("BoundHandler", (Handler,), {"settings": settings, "client": client,
+                                               'accounts': accounts, 'settings_root': shared_data_dir(root).resolve()})
+    cached = index if stamp == Index.stamp(settings.data_dir) else None
+    handler._cache = {"stamp": stamp, "index": cached, 'guest_lock': threading.Lock(),
+                      "paths": {r.get('path') for r in cached.records} if cached else set()}
+    handler.focus_engine = FocusEngine(settings, client)
+    bind_port = int(config.get('REFSEEK_WEB_PORT', settings.web_port)) if port is None else port
+    server = _LocalHTTPServer((host, bind_port), handler)
+    server.scheme = 'https' if context else 'http'
+    default_port = 443 if context else 80
+    actual_port = server.server_port
+    suffix = f':{actual_port}' if actual_port != default_port else ''
+    names = {public_host} | ({'localhost', '127.0.0.1'} if local else set())
+    server.account_hosts = {name + suffix for name in names}
+    server.tunnel_host = tunnel_host
+    server.access_url = f'{server.scheme}://{public_host}{suffix}/'
+    if context:
+        server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+    server.daemon_threads = True
     return server, index
 
 
 def serve(settings: Settings, client: EmbedClient):
     server, index = build_server(settings, client)
-    host, port = settings.web_host, settings.web_port
     if index is None:
         print("index: UNREADABLE — run: python run.py doctor")
     else:
         print(f"index: {len(index.records)} vectors, {index.dim or '?'}d, model {index.model or settings.model}")
-    print(f"web UI: http://{host}:{port}   (Ctrl+C to stop)")
+    print(f"web UI: {server.access_url}   (Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

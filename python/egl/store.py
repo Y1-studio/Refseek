@@ -36,11 +36,25 @@ def _read_retry(path: Path, tries: int = 2) -> bytes:
 
 
 class Index:
+    @property
+    def folder_tree(self):
+        from .folder_scope import folder_tree
+        if not hasattr(self, '_folder_tree'):
+            self._folder_tree = folder_tree(self.roots, self.records)
+        return self._folder_tree
+
+    def image_vector_at(self, path):
+        return next((v for record, v in zip(self.records, self.vectors)
+                     if record.get('path') == path and record.get('kind') == 'image'), None)
+
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.meta_path = self.data_dir / "index.json"
         self.vec_path = self.data_dir / "vectors.f32"
         self.dim = None
+        self.search_dim = None
+        self._reduced_vectors = None
+        self._reduced_matrix = None
         self.model = None
         self.api_type = None
         self.roots = []
@@ -156,6 +170,8 @@ class Index:
         self.records.append(record)
         self.vectors.append(array("f", vector))
         self._matrix = None
+        self._reduced_vectors = self._reduced_matrix = None
+        self.__dict__.pop('_folder_tree', None)
 
     def ensure_dim(self, dim):
         if not self.dim:
@@ -176,6 +192,8 @@ class Index:
             keep_v.append(vec)
         self.records, self.vectors = keep_r, keep_v
         self._matrix = None
+        self._reduced_vectors = self._reduced_matrix = None
+        self.__dict__.pop('_folder_tree', None)
         return dropped
 
     def set_state(self, model: str, api_type: str, roots, kind_filter=_KEEP):
@@ -258,6 +276,7 @@ class Index:
             st["kind"] = rec.get("kind")
             st["mtime_ns"] = rec.get("mtime_ns")
             st["size"] = rec.get("size")
+            st["sha256"] = rec.get("sha256")
         return out
 
     def records_by_path(self) -> dict:
@@ -275,9 +294,18 @@ class Index:
         return self._matrix
 
     def search(self, query, k=20, kinds=None, negatives=None, neg_weight=1.0, roots=None,
-               offset=0, neg_images=None, neg_image_weight=1.0) -> list[dict]:
+               offset=0, neg_images=None, neg_image_weight=1.0, scope=None) -> list[dict]:
         if not self.records or not self.dim:
             return []
+        vectors = self.vectors
+        if self.search_dim and self.search_dim < self.dim:
+            from .dimensions import prefix_vector
+            if self._reduced_vectors is None:
+                self._reduced_vectors = [array('f', prefix_vector(v, self.search_dim)) for v in vectors]
+            vectors = self._reduced_vectors
+            query = prefix_vector(query, self.search_dim)
+            negatives = [prefix_vector(v, self.search_dim) for v in negatives or []]
+            neg_images = [prefix_vector(v, self.search_dim) for v in neg_images or []]
         norm = sum(x * x for x in query) ** 0.5 or 1.0
         q = array("f", [x / norm for x in query])
         n = len(self.vectors)
@@ -287,7 +315,12 @@ class Index:
             rootpfx = [str(r).rstrip("/\\") + sep for r in roots if str(r).strip()]
             if not rootpfx:
                 rootpfx = None
-        mat = self.matrix()
+        if vectors is self.vectors:
+            mat = self.matrix()
+        else:
+            if _np is not None and self._reduced_matrix is None:
+                self._reduced_matrix = _np.asarray(vectors, dtype=_np.float32)
+            mat = self._reduced_matrix
         if mat is not None:
             scores = mat.dot(_np.asarray(q, dtype=_np.float32)).tolist()
             pos = list(scores)
@@ -308,7 +341,7 @@ class Index:
                 neg = mat.dot(nq).tolist()
                 scores = [s - neg_image_weight * t for s, t in zip(scores, neg)]
         else:
-            scores = [math.sumprod(q, v) for v in self.vectors]
+            scores = [math.sumprod(q, v) for v in vectors]
             pos = list(scores)
             if negatives:
                 normed = []
@@ -317,7 +350,7 @@ class Index:
                     normed.append([x / nnorm for x in nv])
                 mean = [sum(col) / len(normed) for col in zip(*normed)]
                 nq = array("f", mean)
-                neg = [math.sumprod(nq, v) for v in self.vectors]
+                neg = [math.sumprod(nq, v) for v in vectors]
                 scores = [s - neg_weight * t for s, t in zip(scores, neg)]
             if neg_images:
                 normed = []
@@ -326,12 +359,14 @@ class Index:
                     normed.append([x / nnorm for x in nv])
                 mean = [sum(col) / len(normed) for col in zip(*normed)]
                 nq = array("f", mean)
-                neg = [math.sumprod(nq, v) for v in self.vectors]
+                neg = [math.sumprod(nq, v) for v in vectors]
                 scores = [s - neg_image_weight * t for s, t in zip(scores, neg)]
         hits = []
         kindset = set(kinds) if kinds else None
         for i, (score, rec) in enumerate(zip(scores, self.records)):
             if kindset and rec.get("kind") not in kindset:
+                continue
+            if scope is not None and not scope.allows(rec.get("path", "")):
                 continue
             if rootpfx is not None:
                 p = rec.get("path") or ""
@@ -369,9 +404,15 @@ class Index:
         }
 
     def storage_info(self):
+        def snapshot_size(entry):
+            path = self.data_dir / entry['snapshot'] / 'index.json'
+            try:
+                return entry['size_bytes'] + entry.get('search_size_bytes', 0) + path.stat().st_size
+            except OSError:
+                return entry['size_bytes'] + entry.get('search_size_bytes', 0)
         return dict(format='per-folder' if self._catalog else 'legacy',
                     folders=len(self._folder_entries),catalog=str(self.data_dir/'catalog.json'),
-                    indexes=[dict(root=e['root'],id=e['id'],files=e['files'],vectors=e['count'],size_bytes=e['size_bytes'],
+                    indexes=[dict(root=e['root'],id=e['id'],files=e['files'],vectors=e['count'],size_bytes=e['size_bytes'],index_bytes=snapshot_size(e),
                                   index_dir=str(self.data_dir/e['snapshot'])) for e in self._folder_entries])
 
     def reset(self):

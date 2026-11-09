@@ -14,7 +14,8 @@ PROBE_ORDER = [
 
 
 def _default_data_dir() -> str:
-    return str(Path(__file__).resolve().parent.parent / "data")
+    from .portable import source_data_dir
+    return str(source_data_dir(Path(__file__).resolve().parent.parent))
 
 
 @dataclass
@@ -24,10 +25,10 @@ class Settings:
     model: str = "embeddinggemma-2"
     api_key: str = "lm-studio"
     dim: int | None = 768
-    threads: int = 4
+    threads: int = 2
     timeout: int = 900
     batch: int = 8
-    index_kinds: str = ""
+    index_kinds: str = "image"
     image_max: int = 1024
     rescan: bool = False
     checkpoint_files: int = 200
@@ -68,6 +69,12 @@ class Settings:
         if env.get("EG_DOC_PROMPT"):
             s.doc_prompt = env["EG_DOC_PROMPT"]
         s.data_dir = env.get("EG_DATA_DIR") or _default_data_dir()
+        from .index_preferences import load
+        saved = load(s.data_dir, fallback_workers=s.threads)
+        if 'EG_THREADS' not in env:
+            s.threads = saved['prepare_workers']
+        if 'EG_INDEX_KINDS' not in env:
+            s.index_kinds = ','.join(saved['kinds'])
         s.max_file_mb = _int_or(env.get("EG_MAX_FILE_MB"), s.max_file_mb)
         s.chunk_chars = _int_or(env.get("EG_CHUNK_CHARS"), s.chunk_chars)
         s.chunk_overlap = _int_or(env.get("EG_CHUNK_OVERLAP"), s.chunk_overlap)

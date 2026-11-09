@@ -3,7 +3,7 @@ use crate::{
     preferences::GuiSettings,
     runtime,
     search::{Engine, Hit, Query},
-    store::{IndexProgress, Library, RootInfo},
+    store::{Cleanup, IndexProgress, Library, RootInfo, SearchFolder, Stats},
     util::*,
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
@@ -20,21 +20,33 @@ use std::{
 };
 enum Command {
     Index(Vec<PathBuf>, HashSet<String>),
+    Verify(Vec<PathBuf>, HashSet<String>),
+    PreparationWorkers(usize),
     Remove(PathBuf),
+    Dimension(usize),
+    CleanupSnapshots,
     Shutdown,
 }
 enum Event {
     Status(String),
     Ready(String, PathBuf),
     Roots(Vec<RootInfo>),
+    Folders(Vec<SearchFolder>),
+    Dimension(usize, bool),
     Hits(Vec<Hit>),
     Done(String),
     Error(String),
     Stopped,
     IndexStatus(String),
     IndexProgress(IndexProgress),
+    CleanupFinished(Res<Cleanup>),
     SearchStatus(String),
     SearchError(String),
+}
+fn library_state(tx: &mpsc::Sender<Event>, lib: &Library) {
+    let _ = tx.send(Event::Roots(lib.infos()));
+    let _ = tx.send(Event::Folders(lib.search_folders()));
+    let _ = tx.send(Event::Dimension(lib.dimension, lib.roots.iter().any(|r| !r.records.is_empty())));
 }
 struct SearchWorker {
     handle: Option<thread::JoinHandle<()>>,
@@ -62,9 +74,12 @@ fn worker(
     let report = |s: String| {
         let _ = tx.send(Event::Status(s));
     };
+    let mut library_loaded = false;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
-        let mut lib = Library::open(&o.data)?;
-        let _ = tx.send(Event::Roots(lib.infos()));
+        let mut lib = Library::open_with_dimension(&o.data, o.dimension)?;
+        lib.prepare_workers=o.prepare_workers;
+        library_loaded = true;
+        library_state(&tx, &lib);
         let assets = runtime::assets(&o.home, o.assets.as_deref(), &cancel, &report)?;
         report("Loading the frozen style adapters…".into());
         let mut engine = Engine::new(&assets, &o.home.join("data"))?;
@@ -79,7 +94,7 @@ fn worker(
         )?;
         save_json(
             &o.home.join("data/last-backend.json"),
-            &serde_json::json!({"backend":runtime.backend,"device":runtime.device,"probes":runtime.probes}),
+            &serde_json::json!({"backend":runtime.backend,"device":runtime.device,"probes":runtime.probes,"attempts":runtime.attempts}),
         )?;
         let search_events = tx.clone();
         let search_api = runtime.api.clone();
@@ -122,44 +137,73 @@ fn worker(
             cancel: search_cancel,
         };
         let _ = tx.send(Event::Ready(
-            format!("{} · {}", runtime.backend.to_uppercase(), runtime.device),
+            format!("{} · {}{}", runtime.backend.to_uppercase(), runtime.device,
+                if runtime.backend == "cpu" && o.backend == "auto" {" · GPU unavailable; see backend-attempts.json"} else {""}),
             assets,
         ));
         while let Ok(command) = rx.recv() {
             if closing.load(Ordering::Relaxed) {
                 break;
             }
+            let verify_contents = matches!(&command, Command::Verify(..));
             let outcome = match command {
                 Command::Shutdown => break,
+                Command::CleanupSnapshots => {
+                    let result = crate::store::cleanup_snapshots(&o.data, false);
+                    let _ = save_json(&o.data.join("last-cleanup.json"), &result);
+                    let _ = tx.send(Event::CleanupFinished(result));
+                    continue;
+                },
+                Command::Dimension(d) => lib.set_dimension(d).map(|_| format!("New library dimension: {d}")),
+                Command::PreparationWorkers(n)=>{lib.prepare_workers=n;Ok(format!("Image preparation: {} CPU workers",crate::image_pipeline::worker_count(n)))},
                 Command::Remove(p) => lib.remove(&p).map(|_| {
                     "Folder removed from the native library. Original files are unchanged.".into()
                 }),
-                Command::Index(paths, kinds) => {
+                Command::Index(paths, kinds) | Command::Verify(paths, kinds) => {
                     let mut summaries = vec![];
                     let mut result = Ok(());
+                    let mut pending_root = PathBuf::new();
                     for p in paths {
                         if cancel.load(Ordering::Relaxed) {
+                            summaries.push("Indexing cancelled; remaining folders were not updated".into());
+                            let _ = tx.send(Event::IndexProgress(IndexProgress {phase:"Cancelled".into(), ..Default::default()}));
                             break;
                         }
+                        pending_root = p.clone();
+                        lib.last_stats = None;
+                        let source = match canonical(&p) {
+                            Ok(path) => path,
+                            Err(e) => {result = Err(e); break;}
+                        };
+                        if under(&source, &o.private_data) {
+                            result = Err("Choose a picture folder outside Refseek's private data folder.".into());
+                            break;
+                        }
+                        // A collection explicitly selected inside the app folder
+                        // must still include its own subfolders. Protect working
+                        // data, and exclude the whole app when scanning a parent.
+                        let linked_data_inside_source = under(&o.private_data, &source) && !under(&o.private_data, &o.home);
+                        let excluded = if under(&source, &o.home) || linked_data_inside_source {
+                            o.private_data.clone()
+                        } else { o.home.clone() };
                         let index_report = |s| {
                             let _ = tx.send(Event::IndexStatus(s));
                         };
                         let live = |p| {
                             let _ = tx.send(Event::IndexProgress(p));
                         };
-                        let committed = |r| {
-                            let _ = tx.send(Event::Roots(r));
-                        };
-                        match lib.index_live(
-                            &p,
+                        let committed = |library: &Library| library_state(&tx, library);
+                        let scan = if verify_contents { lib.index_live(
+                            &source,
                             &kinds,
                             &runtime.api,
                             &cancel,
                             &index_report,
-                            &o.home,
+                            &excluded,
                             &live,
                             &committed,
-                        ) {
+                        ) } else { lib.update_live(&source, &kinds, &runtime.api, &cancel, &index_report, &excluded, &live, &committed) };
+                        match scan {
                             Ok(stats) => {
                                 let _ = save_json(&o.home.join("data/last-index.json"), &stats);
                                 summaries.push(format!(
@@ -176,18 +220,26 @@ fn worker(
                             }
                         }
                     }
+                    if let Err(error) = &result {
+                        let mut stats = lib.last_stats.clone().unwrap_or(Stats {
+                            root:pending_root, index_dimension:lib.dimension, ..Default::default()
+                        });
+                        stats.error = Some(error.clone());
+                        let _ = save_json(&o.home.join("data/last-index.json"), &stats);
+                    }
                     result.map(|_| summaries.join("\n"))
                 }
             };
-            let _ = tx.send(Event::Roots(lib.infos()));
+            library_state(&tx, &lib);
             match outcome {
                 Ok(s) => {
                     let _ = tx.send(Event::Done(s));
                 }
                 Err(e) => {
-                    if let Ok(reload) = Library::open(&o.data) {
+                    if let Ok(mut reload) = Library::open(&o.data) {
+                        reload.prepare_workers=lib.prepare_workers;
                         lib = reload;
-                        let _ = tx.send(Event::Roots(lib.infos()));
+                        library_state(&tx, &lib);
                     }
                     let _ = tx.send(Event::Error(e));
                 }
@@ -197,7 +249,12 @@ fn worker(
     }));
     match result {
         Ok(Err(e)) => {
-            let _ = tx.send(Event::Error(e));
+            let _ = tx.send(Event::Error(e.clone()));
+            let recovery = if library_loaded { serde_json::Value::Null }
+                else { crate::store::inspect_saved_catalog(&o.data, true)
+                    .unwrap_or_else(|e|serde_json::json!({"passed":false,"error":e,"activated":false})) };
+            let _ = save_json(&o.home.join("data/startup-error.json"),
+                &serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"library":display_path(&o.data),"error":&e,"recovery":recovery}));
         }
         Err(_) => {
             let _ = tx.send(Event::Error(
@@ -212,6 +269,42 @@ struct Thumb {
     path: PathBuf,
     large: bool,
     image: Option<egui::ColorImage>,
+}
+#[derive(Default)]
+struct FolderTree {
+    folders: Vec<SearchFolder>,
+    keys: Vec<String>,
+    children: Vec<Vec<usize>>,
+    roots: Vec<usize>,
+}
+impl FolderTree {
+    fn new(folders: Vec<SearchFolder>) -> Self {
+        let keys: Vec<_> = folders.iter().map(|folder| key(&folder.path)).collect();
+        let by_key: HashMap<_, _> = keys.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
+        let mut children = vec![vec![]; folders.len()];
+        let mut roots = vec![];
+        for (i, folder) in folders.iter().enumerate() {
+            let parent = folder.path.ancestors().skip(1)
+                .find_map(|ancestor| by_key.get(key(ancestor).as_str()).copied());
+            if let Some(parent) = parent {
+                children[parent].push(i);
+            } else {
+                roots.push(i);
+            }
+        }
+        Self { folders, keys, children, roots }
+    }
+    fn visible_rows(&self, expanded: &HashSet<String>) -> Vec<(usize, usize)> {
+        let mut rows = Vec::new();
+        let mut stack: Vec<_> = self.roots.iter().rev().map(|&i| (i, 0)).collect();
+        while let Some((i, depth)) = stack.pop() {
+            rows.push((i, depth));
+            if expanded.contains(&self.keys[i]) {
+                stack.extend(self.children[i].iter().rev().map(|&child| (child, depth + 1)));
+            }
+        }
+        rows
+    }
 }
 fn navigation_button(ui: &mut egui::Ui, label: &str, next: bool, enabled: bool) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| {
@@ -251,6 +344,11 @@ pub struct App {
     opened_at: Instant,
     roots: Vec<RootInfo>,
     scope: HashSet<String>,
+    excluded_scope: HashSet<String>,
+    folder_tree: FolderTree,
+    expanded_folders: HashSet<String>,
+    settings_dimension: usize,
+    dimension_locked: bool,
     hits: Vec<Hit>,
     page: usize,
     error: Option<String>,
@@ -261,7 +359,9 @@ pub struct App {
     thumb_rx: mpsc::Receiver<Thumb>,
     textures: HashMap<(PathBuf, bool), egui::TextureHandle>,
     requested: HashSet<(PathBuf, bool)>,
+    failed_pictures: HashSet<(PathBuf, bool)>,
     settings_backend: String,
+    prepare_workers: usize,
     smoke_stage: u8,
     smoke_deadline: Instant,
     screenshot_at: Option<Instant>,
@@ -273,10 +373,14 @@ pub struct App {
     searching: bool,
     index_status: String,
     index_progress: Option<IndexProgress>,
+    index_details: Option<Res<Stats>>,
+    cleanup_running: bool,
+    last_cleanup: Option<Res<Cleanup>>,
     last_preview_rect: Option<egui::Rect>,
     diagnostic_key: Option<egui::Key>,
     diagnostic_drop: Option<PathBuf>,
     diagnostic_evidence: serde_json::Value,
+    diagnostic_catalog_lock: Option<std::fs::File>,
     layout_checks: HashMap<String, serde_json::Value>,
 }
 impl App {
@@ -290,6 +394,7 @@ impl App {
         let _ = save_json(&o.home.join("data/last-ui-renderer.json"), &graphics);
         let gui = GuiSettings::load(&o.home.join("data/settings.json"));
         gui.apply(&cc.egui_ctx);
+        let kinds=crate::preferences::index_kinds(&o.home.join("data/settings.json"));
         let (tx, crx) = mpsc::channel();
         let (etx, rx) = mpsc::channel();
         let (search_tx, search_rx) = mpsc::channel();
@@ -323,7 +428,11 @@ impl App {
             }
         });
         Self {
+            last_cleanup: read_json(&o.data.join("last-cleanup.json")).ok(),
+            settings_dimension: o.dimension,
+            dimension_locked: false,
             settings_backend: o.backend.clone(),
+            prepare_workers: o.prepare_workers,
             o,
             tx,
             rx,
@@ -343,19 +452,20 @@ impl App {
             opening,
             roots: vec![],
             scope: HashSet::new(),
+            excluded_scope: HashSet::new(),
+            folder_tree: FolderTree::default(),
+            expanded_folders: HashSet::new(),
             hits: vec![],
             page: 0,
             error: None,
             index_path: String::new(),
-            kinds: ["image", "text", "document"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            kinds,
             preview: None,
             thumb_tx: ttx,
             thumb_rx: irx,
             textures: HashMap::new(),
             requested: HashSet::new(),
+            failed_pictures: HashSet::new(),
             smoke_stage: 0,
             smoke_deadline: Instant::now() + Duration::from_secs(600),
             screenshot_at: None,
@@ -367,20 +477,25 @@ impl App {
             searching: false,
             index_status: String::new(),
             index_progress: None,
+            index_details: None,
+            cleanup_running: false,
             last_preview_rect: None,
             diagnostic_key: None,
             diagnostic_drop: None,
             diagnostic_evidence: serde_json::json!({}),
+            diagnostic_catalog_lock: None,
             layout_checks: HashMap::new(),
         }
     }
     fn send(&mut self, c: Command) {
-        if matches!(&c, Command::Index(..)) {
+        let cleanup = matches!(&c, Command::CleanupSnapshots);
+        if matches!(&c, Command::Index(..) | Command::Verify(..)) {
             self.index_progress = Some(IndexProgress {
                 phase: "Scanning".into(),
                 ..Default::default()
             });
-            self.index_status = "Preparing folder scan…".into();
+            self.index_status = if matches!(&c, Command::Verify(..)) {"Preparing full file-content verification…"}
+                else {"Checking files against the saved index…"}.into();
         }
         self.error = None;
         self.busy = true;
@@ -388,18 +503,53 @@ impl App {
         if self.tx.send(c).is_err() {
             self.busy = false;
             self.error = Some("The model worker is not running. Restart the application.".into());
+        } else if cleanup {
+            self.cleanup_running = true;
+        }
+    }
+    fn load_index_details(&self) -> Res<Stats> {
+        let path = self.o.home.join("data/last-index.json");
+        if !path.is_file() {
+            return Err("No indexing report yet. Add or update a folder to create one.".into());
+        }
+        read_json(&path).map_err(|e| format!("Could not read the indexing report. {e}"))
+    }
+    fn toggle_index_details(&mut self) {
+        self.index_details = if self.index_details.is_some() { None } else { Some(self.load_index_details()) };
+    }
+    fn has_folder_filters(&self) -> bool {
+        self.q.only_folder.is_some() || !self.scope.is_empty() || !self.excluded_scope.is_empty()
+    }
+    fn clear_folder_filters(&mut self) {
+        self.q.only_folder = None;
+        self.scope.clear();
+        self.excluded_scope.clear();
+    }
+    fn has_search_input(&self) -> bool {
+        self.q.image.is_some() || !self.q.text.trim().is_empty() || self.wants.iter().any(|s| !s.trim().is_empty())
+    }
+    fn search_all_folders(&mut self) {
+        self.clear_folder_filters();
+        if self.has_search_input() {
+            self.do_search();
+        }
+    }
+    fn search_picture_folder(&mut self, folder: PathBuf) {
+        self.clear_folder_filters();
+        self.q.only_folder = Some(folder);
+        self.preview = None;
+        if self.has_search_input() {
+            self.do_search();
         }
     }
     fn do_search(&mut self) {
         if !self.ready || self.searching {
             return;
         }
-        self.q.roots = self
-            .roots
-            .iter()
-            .filter(|r| self.scope.contains(&key(&r.path)))
-            .map(|r| r.path.clone())
-            .collect();
+        // Keep selected rules even if a live index update removes a folder.
+        // Dropping the last Include rule would silently broaden the search.
+        self.q.roots = self.scope.iter().map(PathBuf::from).collect();
+        self.q.excluded_roots = self.excluded_scope.iter().map(PathBuf::from).collect();
         self.page = 0;
         self.error = None;
         self.searching = true;
@@ -438,6 +588,18 @@ impl App {
                     self.status = "Ready".into();
                 }
                 Event::Roots(r) => self.roots = r,
+                Event::Folders(f) => self.folder_tree = FolderTree::new(f),
+                Event::Dimension(d, locked) => {
+                    self.settings_dimension = d;
+                    self.dimension_locked = locked;
+                    let path = self.o.home.join("data/settings.json");
+                    let saved: serde_json::Value = read_json(&path).unwrap_or_default();
+                    if saved["index_dimension"].as_u64() != Some(d as u64) {
+                        if let Err(e) = crate::preferences::merge(&path, "index_dimension", serde_json::json!(d)) {
+                            self.error = Some(e);
+                        }
+                    }
+                },
                 Event::Hits(h) => {
                     self.hits = h;
                     self.page = 0;
@@ -447,15 +609,32 @@ impl App {
                 Event::Done(s) => {
                     self.status = s;
                     self.busy = false;
+                    if self.index_details.is_some() {
+                        self.index_details = Some(self.load_index_details());
+                    }
+                }
+                Event::CleanupFinished(result) => {
+                    self.status = if result.is_ok() { "Snapshot cleanup finished" } else { "Snapshot cleanup failed" }.into();
+                    self.last_cleanup = Some(result);
+                    self.cleanup_running = false;
+                    self.busy = false;
                 }
                 Event::Error(e) => {
+                    if let Some(p) = self.index_progress.as_mut() {
+                        if matches!(p.phase.as_str(), "Scanning" | "Indexing") {
+                            p.phase = "Failed".into();
+                            p.eta_seconds = None;
+                        }
+                    }
                     self.error = Some(e.clone());
                     self.status = e;
                     self.busy = false;
+                    if self.index_details.is_some() { self.index_details = Some(self.load_index_details()); }
                 }
                 Event::Stopped => {
                     self.stopped = true;
                     self.busy = false;
+                    self.cleanup_running = false;
                     self.ready = false;
                     self.searching = false;
                 }
@@ -470,15 +649,29 @@ impl App {
             }
         }
         while let Ok(t) = self.thumb_rx.try_recv() {
+            let key = (t.path.clone(), t.large);
+            self.requested.remove(&key);
             if let Some(i) = t.image {
+                self.failed_pictures.remove(&key);
                 if self.textures.len() > 500 {
                     self.textures.clear();
-                    self.requested.clear();
                 }
                 let handle =
                     ctx.load_texture(t.path.to_string_lossy(), i, egui::TextureOptions::LINEAR);
                 self.textures.insert((t.path, t.large), handle);
+            } else {
+                self.failed_pictures.insert(key);
             }
+        }
+    }
+    fn request_picture(&mut self, path: &PathBuf, large: bool) {
+        let key = (path.clone(), large);
+        if self.failed_pictures.contains(&key) || !self.requested.insert(key.clone()) {
+            return;
+        }
+        if self.thumb_tx.send(key.clone()).is_err() {
+            self.requested.remove(&key);
+            self.failed_pictures.insert(key);
         }
     }
     fn picture(
@@ -494,13 +687,18 @@ impl App {
             let factor = (size.x / fit.x).min(size.y / fit.y).min(1.);
             ui.add(egui::Image::new((t.id(), fit * factor)).sense(egui::Sense::click()))
         } else {
-            if self.requested.insert(k) {
-                let _ = self.thumb_tx.send((path.clone(), large));
-            }
-            ui.add_sized(
+            let failed = self.failed_pictures.contains(&k);
+            self.request_picture(path, large);
+            let response = ui.add_sized(
                 size,
-                egui::Label::new(RichText::new("Image preview").weak()).sense(egui::Sense::click()),
-            )
+                egui::Label::new(RichText::new(if failed { "Preview unavailable · Click to retry" }
+                    else { "Loading preview…" }).weak()).sense(egui::Sense::click()),
+            );
+            if failed && response.clicked() {
+                self.failed_pictures.remove(&k);
+                self.request_picture(path, large);
+            }
+            response
         }
     }
     fn reference(&mut self, ui: &mut egui::Ui) {
@@ -696,6 +894,11 @@ impl App {
                         {
                             self.do_search();
                         }
+                        if self.has_folder_filters() && ui.add_enabled(self.ready && !self.searching,
+                            egui::Button::new("Search all folders")).on_hover_text("Clear folder filters and search the whole library").clicked()
+                        {
+                            self.search_all_folders();
+                        }
                         if self.searching {
                             ui.spinner();
                             if self.ready && ui.small_button("Cancel").clicked() {
@@ -703,6 +906,10 @@ impl App {
                             }
                         }
                     });
+                    if let Some(folder) = &self.q.only_folder {
+                        let path = display_path(folder);
+                        ui.add(egui::Label::new(format!("Folder only · {path}")).truncate()).on_hover_text(path);
+                    }
                 });
             },
         );
@@ -710,7 +917,8 @@ impl App {
             "Refine · negative image active"
         } else { "Refine results & search scope" })
             .id_salt("refine-results");
-        let refine = if self.o.gui_smoke && self.smoke_stage == 12 {
+        let refine = if self.o.gui_smoke && (self.smoke_stage == 12
+            || (std::env::args().any(|s| s == "--feature-gui-check") && matches!(self.smoke_stage, 5 | 8))) {
             refine.open(Some(true))
         } else { refine };
         refine.show(ui, |ui| {
@@ -735,21 +943,7 @@ impl App {
             );
             ui.label("Text exclusion weight");
             ui.add(egui::Slider::new(&mut self.q.negative_weight, 0.0..=2.0));
-            ui.label("Folders · none selected searches all");
-            for r in &self.roots {
-                let k = key(&r.path);
-                let mut selected = self.scope.contains(&k);
-                if ui
-                    .checkbox(&mut selected, display_path(&r.path))
-                    .changed()
-                {
-                    if selected {
-                        self.scope.insert(k);
-                    } else {
-                        self.scope.remove(&k);
-                    }
-                }
-            }
+            self.folder_scope_ui(ui);
         });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -880,6 +1074,68 @@ impl App {
             }
         });
     }
+    fn folder_scope_ui(&mut self, ui: &mut egui::Ui) {
+        let heading = ui.label(RichText::new("Folders and subfolders").strong());
+        if self.o.gui_smoke && matches!(self.smoke_stage, 5 | 8) && std::env::args().any(|s| s == "--feature-gui-check") {
+            heading.scroll_to_me(Some(egui::Align::Min));
+        }
+        ui.small("Open a folder with +. Include and Skip apply to subfolders, and a deeper rule takes precedence. With no Include rules, Refseek searches all folders except those you skip.");
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!self.expanded_folders.is_empty(), egui::Button::new("Collapse all").small()).clicked() {
+                self.expanded_folders.clear();
+            }
+            if ui.add_enabled(self.has_folder_filters() && !self.searching,
+                egui::Button::new("Clear folder filters").small()).clicked() {
+                self.search_all_folders();
+            }
+            ui.small(format!("{} included · {} skipped", self.scope.len(), self.excluded_scope.len()));
+        });
+        let folders = self.folder_tree.visible_rows(&self.expanded_folders);
+        let height = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y);
+        let toggle_size = egui::vec2(height + 2. * ui.spacing().button_padding.x, height);
+        egui::ScrollArea::vertical().id_salt("search-folder-tree").max_height(260.)
+            .show_rows(ui, height, folders.len(), |ui, rows| {
+                for i in rows {
+                    let (i, depth) = folders[i];
+                    let folder = &self.folder_tree.folders[i];
+                    let k = &self.folder_tree.keys[i];
+                    ui.push_id(k, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space((depth as f32 * 14.).min(ui.available_width() * 0.25));
+                            if self.folder_tree.children[i].is_empty() {
+                                ui.allocate_space(toggle_size);
+                            } else {
+                                let open = self.expanded_folders.contains(k);
+                                let label = if open { "-" } else { "+" };
+                                if ui.add(egui::Button::new(label).small().min_size(toggle_size))
+                                    .on_hover_text(if open { "Collapse subfolders" } else { "Expand subfolders" }).clicked()
+                                {
+                                    if open { self.expanded_folders.remove(k); }
+                                    else { self.expanded_folders.insert(k.clone()); }
+                                }
+                            }
+                            let mut include = self.scope.contains(k);
+                            let mut exclude = self.excluded_scope.contains(k);
+                            if ui.checkbox(&mut include, "Include").changed() {
+                                self.q.only_folder = None;
+                                if include {self.scope.insert(k.clone()); self.excluded_scope.remove(k); exclude = false;}
+                                else {self.scope.remove(k);}
+                            }
+                            if ui.checkbox(&mut exclude, "Skip").changed() {
+                                self.q.only_folder = None;
+                                if exclude {self.excluded_scope.insert(k.clone()); self.scope.remove(k);}
+                                else {self.excluded_scope.remove(k);}
+                            }
+                            let label = if depth == 0 {display_path(&folder.path)}
+                                else {folder.path.file_name().unwrap_or_default().to_string_lossy().into_owned()};
+                            let unit = if folder.files == 1 { "file" } else { "files" };
+                            ui.add(egui::Label::new(format!("{label} · {} {unit}", folder.files)).truncate())
+                                .on_hover_text(display_path(&folder.path));
+                        });
+                    });
+                }
+            });
+    }
     fn negative_image_ui(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -923,6 +1179,8 @@ impl App {
     }
     fn index_meter(&self, ui: &mut egui::Ui) {
         if let Some(p) = &self.index_progress {
+            ui.label(format!("Embedding backend: {} · {}-dimension index", self.backend, self.settings_dimension));
+            ui.small("Folder scanning and image preparation use the CPU; embeddings use the backend shown above.");
             let duration = |s: f64| {
                 let n = s.max(0.) as u64;
                 format!("{}:{:02}", n / 60, n % 60)
@@ -934,11 +1192,15 @@ impl App {
             if p.phase == "Scanning" {
                 ui.spinner();
                 ui.label(format!(
-                    "{} files found · elapsed {}",
+                    "{} files checked · {} unchanged · elapsed {}",
                     p.total,
+                    p.metadata_skipped,
                     duration(p.elapsed_seconds)
                 ));
             } else {
+                if p.metadata_skipped > 0 {
+                    ui.small(format!("{} unchanged files reused from the saved index without reading their contents.", p.metadata_skipped));
+                }
                 ui.add(
                     egui::ProgressBar::new(if p.total > 0 {
                         p.processed as f32 / p.total as f32
@@ -964,6 +1226,11 @@ impl App {
                 .on_hover_text(&self.index_status);
             if self.busy {
                 ui.small("Search remains available using completed snapshots. Newly indexed files appear at checkpoints.");
+                if p.phase == "Indexing" && p.total > 0 {
+                    let (search, cache) = vector_storage(p.total, self.settings_dimension);
+                    ui.small(format!("This scan: about {} of vectors for {} files, assuming one vector per file. Metadata is extra.",
+                        storage_size(search.saturating_add(cache)), p.total));
+                }
             }
         }
     }
@@ -1030,18 +1297,21 @@ impl App {
                         Color32::WHITE,
                     );
                 } else {
-                    if self.requested.insert(key) {
-                        let _ = self.thumb_tx.send((path.clone(), true));
-                    }
+                    self.request_picture(&path, true);
                     ui.painter().text(
                         canvas.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Loading image…",
+                        if self.failed_pictures.contains(&key) { "Preview unavailable. Use Retry image below." }
+                            else { "Loading image…" },
                         egui::FontId::proportional(self.gui.text_size),
                         ui.visuals().text_color(),
                     );
                 }
                 ui.horizontal_wrapped(|ui| {
+                    if self.failed_pictures.contains(&(path.clone(), true)) && ui.button("Retry image").clicked() {
+                        self.failed_pictures.remove(&(path.clone(), true));
+                        self.request_picture(&path, true);
+                    }
                     if navigation_button(ui, "Previous", false, at > 0).clicked()
                     {
                         self.move_preview(-1);
@@ -1073,6 +1343,14 @@ impl App {
                         self.q.ignore_image = Some(path.clone());
                         self.preview = None;
                     }
+                    if let Some(folder) = path.parent() {
+                        if ui.add_enabled(self.ready && !self.searching, egui::Button::new("Search this folder only"))
+                            .on_hover_text(format!("Run the current search in {} without subfolders", display_path(folder)))
+                            .clicked()
+                        {
+                            self.search_picture_folder(folder.to_path_buf());
+                        }
+                    }
                     if ui.button("Open original").clicked() {
                         platform::reveal(&path, false);
                     }
@@ -1103,7 +1381,7 @@ impl App {
             }
             if ui
                 .add_enabled(
-                    self.ready && !self.busy && !self.index_path.trim().is_empty(),
+                    self.ready && !self.busy && !self.index_path.trim().is_empty() && !self.kinds.is_empty(),
                     egui::Button::new("Add & index"),
                 )
                 .clicked()
@@ -1114,8 +1392,9 @@ impl App {
                 ));
             }
         });
+        let before_kinds=self.kinds.clone();
         ui.horizontal_wrapped(|ui| {
-            for k in ["image", "text", "document", "audio", "video"] {
+            for k in crate::preferences::INDEX_KINDS {
                 let mut on = self.kinds.contains(k);
                 if ui.checkbox(&mut on, k).changed() {
                     if on {
@@ -1127,11 +1406,15 @@ impl App {
             }
             ui.small("Audio/video are experimental model inputs.");
         });
+        if self.kinds!=before_kinds {
+            if let Err(e)=crate::preferences::save_index_kinds(&self.o.home.join("data/settings.json"),&self.kinds){self.error=Some(e);}
+        }
+        if self.kinds.is_empty(){ui.small("Select at least one file type to index.");}
         ui.add_space(8.);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    self.ready && !self.busy && !self.roots.is_empty(),
+                    self.ready && !self.busy && !self.roots.is_empty() && !self.kinds.is_empty(),
                     egui::Button::new("Update all folders"),
                 )
                 .clicked()
@@ -1141,7 +1424,7 @@ impl App {
                     self.kinds.clone(),
                 ));
             }
-            if self.busy {
+            if self.busy && !self.cleanup_running {
                 ui.spinner();
                 ui.label("Complete files are checkpointed.");
                 if self.ready && ui.button("Cancel indexing").clicked() {
@@ -1150,6 +1433,8 @@ impl App {
             }
         });
         self.index_meter(ui);
+        ui.separator();
+        self.library_reports(ui);
         ui.separator();
         let roots = self.roots.clone();
         ui.scope(|ui| {
@@ -1165,15 +1450,24 @@ impl App {
                         "{} files · {} vectors · independent snapshot",
                         r.files, r.vectors
                     ));
+                    ui.label(format!("Saved index: {} · Indexed originals: {}",
+                        storage_size(r.index_bytes), storage_size(r.source_bytes)))
+                        .on_hover_text("Saved index includes metadata, search vectors and any style cache for the active snapshot. Indexed originals are measured at the last scan; earlier snapshots and model files are separate.");
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
-                                self.ready && !self.busy,
+                                self.ready && !self.busy && !self.kinds.is_empty(),
                                 egui::Button::new("Update this folder"),
                             )
+                            .on_hover_text("Fast update compares saved file size and modified date. Use Verify file contents to detect edits that preserve both.")
                             .clicked()
                         {
                             self.send(Command::Index(vec![r.path.clone()], self.kinds.clone()));
+                        }
+                        if ui.add_enabled(self.ready && !self.busy && !self.kinds.is_empty(), egui::Button::new("Verify file contents"))
+                            .on_hover_text("Reads and hashes every file, then indexes any changed content. Use when files were edited while preserving their size and modified date.")
+                            .clicked() {
+                            self.send(Command::Verify(vec![r.path.clone()], self.kinds.clone()));
                         }
                         if ui.small_button("Open folder").clicked() {
                             platform::reveal(&r.path, false);
@@ -1200,11 +1494,63 @@ impl App {
             if self.roots.is_empty() {
                 ui.label("No folders indexed yet. Add a folder above.");
             }
-            ui.add_space(15.);
-            if ui.button("Open latest indexing details").clicked() {
-                platform::reveal(&self.o.home.join("data/last-index.json"), false);
+        });
+    }
+    fn library_reports(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(self.ready && !self.busy && self.o.data.join("catalog.json").is_file(),
+                egui::Button::new("Clean up old snapshots")).clicked() {
+                self.send(Command::CleanupSnapshots);
+            }
+            let label = if self.index_details.is_some() { "Hide latest indexing details" } else { "Show latest indexing details" };
+            if ui.button(label).clicked() {
+                self.toggle_index_details();
             }
         });
+        if self.cleanup_running {
+            ui.label("Checking the active and recovery indexes, then removing old snapshots…");
+        } else if let Some(result) = &self.last_cleanup {
+            match result {
+                Ok(r) if r.candidates == 0 => {
+                    ui.label("Last cleanup: no old snapshots to remove. The active index and any recovery copy are already kept.");
+                }
+                Ok(r) => {
+                    ui.label(format!("Last cleanup: removed {} old snapshots and freed {}.", r.removed, storage_size(r.freed_bytes)));
+                    if r.failed != 0 {
+                        ui.label(format!("{} snapshots could not be fully removed. Try cleanup again.", r.failed));
+                    }
+                }
+                Err(e) => { ui.colored_label(ui.visuals().error_fg_color, format!("Cleanup failed: {e}")); }
+            }
+        } else {
+            ui.small("Refseek keeps the active index and one recovery copy. It removes older snapshots after each changed index is saved.");
+        }
+        if let Some(details) = &self.index_details {
+            match details {
+                Err(e) => { ui.label(e); }
+                Ok(stats) => {
+                    ui.label(format!("Last scan {} · {} of {} files processed in {:.1} seconds",
+                        if stats.error.is_some() { "failed" } else if stats.cancelled { "cancelled" } else { "finished" }, stats.processed, stats.discovered, stats.elapsed_seconds));
+                    if let Some(error) = &stats.error { ui.label(error); }
+                    ui.label(format!("{} embedded · {} reused · {} skipped · {} removed from index",
+                        stats.embedded, stats.reused, stats.failed, stats.removed));
+                    if stats.index_dimension != 0 {
+                        ui.small(format!("{} dimensions · {:.1} s embedding · {:.1} s saving snapshots",
+                            stats.index_dimension, stats.embedding_seconds, stats.snapshot_seconds));
+                    }
+                    if stats.preparation_workers>0 {
+                        ui.small(format!("{} CPU preparation workers · {:.1} s waiting for prepared files",stats.preparation_workers,stats.preparation_wait_seconds));
+                    }
+                    if !stats.warnings.is_empty() {
+                        egui::CollapsingHeader::new(format!("Warnings ({})", stats.warnings.len())).show(ui, |ui| {
+                            for warning in &stats.warnings {
+                                ui.label(warning);
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
@@ -1212,10 +1558,67 @@ impl App {
         self.appearance_ui(ui);
         ui.add_space(12.);
         ui.separator();
-        ui.heading("Local model");
+        let model_heading = ui.heading("Local model");
+        if self.o.gui_smoke && ((self.smoke_stage == 6 && std::env::args().any(|s| s == "--feature-gui-check"))
+            || (self.smoke_stage == 14 && std::env::args().any(|s|s=="--interaction-smoke"))) {
+            model_heading.scroll_to_me(Some(egui::Align::Min));
+        }
         ui.add_space(12.);
         ui.label(RichText::new(&self.backend).strong().size(20.));
-        ui.label("EmbeddingGemma 2 Q8 · 768 dimensions · llama.cpp b11741");
+        ui.label("EmbeddingGemma 2 Q8 · native output 768 dimensions · llama.cpp b11741");
+        ui.add_space(12.);
+        ui.label(RichText::new("Image preparation workers").strong());
+        let before_workers=self.prepare_workers;
+        ui.add_enabled_ui(self.ready && !self.busy,|ui|{
+            ui.horizontal_wrapped(|ui|{
+                let mut automatic=self.prepare_workers==0;
+                if ui.checkbox(&mut automatic,"Auto").changed(){
+                    self.prepare_workers=if automatic {0}else{crate::image_pipeline::worker_count(crate::image_pipeline::DEFAULT_WORKERS)};
+                }
+                let mut custom=self.prepare_workers.max(1);
+                if ui.add_enabled(!automatic,egui::DragValue::new(&mut custom)
+                    .range(1..=crate::image_pipeline::maximum_workers()).speed(1.)
+                    .update_while_editing(false).suffix(" CPU workers")).changed(){self.prepare_workers=custom;}
+                if automatic {ui.label(format!("{} workers",crate::image_pipeline::worker_count(0)));}
+            });
+        });
+        ui.small(format!("Default: 2 CPU workers. Enter any count from 1 to {}. Changes apply to the next indexing job and are remembered.",crate::image_pipeline::maximum_workers()));
+        ui.small("Prepares full images on the CPU while the GPU embeds earlier images. A bounded queue limits memory use.");
+        if before_workers!=self.prepare_workers {
+            match crate::preferences::merge(&self.o.home.join("data/settings.json"),"prepare_workers",serde_json::json!(self.prepare_workers)) {
+                Ok(())=>self.send(Command::PreparationWorkers(self.prepare_workers)),Err(e)=>self.error=Some(e),
+            }
+        }
+        ui.add_space(12.);
+        ui.label(RichText::new("Index dimensions").strong());
+        let before_dimension = self.settings_dimension;
+        ui.add_enabled_ui(self.ready && !self.busy && !self.searching && !self.dimension_locked, |ui| {
+            egui::ComboBox::from_id_salt("index-dimension")
+                .selected_text(format!("{} dimensions", self.settings_dimension))
+                .show_ui(ui, |ui| {
+                    for d in [768, 512, 256, 128] {
+                        ui.selectable_value(&mut self.settings_dimension, d,
+                            format!("{d}{}", if d == DEFAULT_INDEX_DIMENSION {" · default"} else {""}));
+                    }
+                });
+        });
+        if before_dimension != self.settings_dimension { self.send(Command::Dimension(self.settings_dimension)); }
+        if self.dimension_locked {
+            ui.small(format!("Detected existing {}-dimension library. Its dimension is kept; use a new library folder for a different size.", self.settings_dimension));
+        } else { ui.small("Choose before indexing. New libraries default to 768; all folders in a library use the same dimension."); }
+        ui.label(RichText::new("Estimated vector storage for 10,000 files").strong());
+        for dimension in INDEX_DIMENSIONS {
+            let (search, cache) = vector_storage(10_000, dimension);
+            let label = if cache == 0 {
+                format!("{dimension}: {} total (no separate style cache)", storage_size(search))
+            } else {
+                format!("{dimension}: {} total ({} search + {} style)",
+                    storage_size(search.saturating_add(cache)), storage_size(search), storage_size(cache))
+            };
+            ui.small(label);
+        }
+        ui.small("Assumes one vector per file, as with images. Documents can use more. Metadata and the recovery copy are extra. Smaller dimensions keep a separate 768-dimension cache for trained Style; at 768, search and Style share the same vectors.");
+        if self.settings_dimension == 128 { ui.colored_label(Color32::YELLOW, "128 dimensions reduces image retrieval quality; prefer 768 for artwork."); }
         ui.add_space(15.);
         ui.label("Backend for the next launch");
         let before = self.settings_backend.clone();
@@ -1356,8 +1759,68 @@ impl App {
             }
         }
     }
+    fn image_retry_check(&mut self) -> Res<()> {
+        if self.closing.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if Instant::now() > self.smoke_deadline {
+            return Err("Image retry verification timed out".into());
+        }
+        if !self.ready || self.busy {
+            return Ok(());
+        }
+        let path = self.o.home.join("verification/retry-image.png");
+        let small = (path.clone(), false);
+        let large = (path.clone(), true);
+        match self.smoke_stage {
+            0 => {
+                std::fs::create_dir_all(path.parent().unwrap()).map_err(err)?;
+                if path.exists() { std::fs::remove_file(&path).map_err(err)?; }
+                self.request_picture(&path, false);
+                self.request_picture(&path, true);
+                self.smoke_stage = 1;
+            }
+            1 if self.failed_pictures.contains(&small) && self.failed_pictures.contains(&large) => {
+                if self.requested.contains(&small) || self.requested.contains(&large) {
+                    return Err("Failed image requests remained pending".into());
+                }
+                crate::rpc::decoded(&self.assets.as_ref().unwrap().join("validation/b01-001.jpg"))?
+                    .save(&path).map_err(err)?;
+                self.failed_pictures.remove(&small);
+                self.failed_pictures.remove(&large);
+                self.request_picture(&path, false);
+                self.request_picture(&path, true);
+                self.smoke_stage = 2;
+            }
+            2 if self.textures.contains_key(&small) && self.textures.contains_key(&large) => {
+                if self.requested.contains(&small) || self.requested.contains(&large)
+                    || self.failed_pictures.contains(&small) || self.failed_pictures.contains(&large)
+                {
+                    return Err("Recovered images retained failed or pending state".into());
+                }
+                save_json(&self.o.report, &serde_json::json!({"small_recovered":true,"large_recovered":true,
+                    "failed_requests_cleared":true,"backend":self.backend}))?;
+                self.smoke_stage = 3;
+                self.stop();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
     fn smoke(&mut self, ctx: &egui::Context) {
+        let report_check = std::env::args().any(|s| s == "--library-report-check");
         if !self.o.gui_smoke {
+            return;
+        }
+        if std::env::args().any(|s| s == "--image-retry-check") {
+            if let Err(error) = self.image_retry_check() {
+                let _ = save_json(&self.o.report, &serde_json::json!({"error":error}));
+                self.stop();
+            }
+            return;
+        }
+        if std::env::args().any(|s| s == "--feature-gui-check") {
+            self.feature_gui_check(ctx);
             return;
         }
         if std::env::args().any(|s| s == "--interaction-smoke") {
@@ -1375,6 +1838,9 @@ impl App {
         if self.ready && !self.busy && !self.searching {
             match self.smoke_stage {
                 0 => {
+                    if report_check {
+                        self.diagnostic_evidence["existing_index_report"] = serde_json::to_value(self.load_index_details()).unwrap_or_default();
+                    }
                     self.smoke_stage = 1;
                     let p = self.assets.as_ref().unwrap().join("validation");
                     self.send(Command::Index(
@@ -1390,6 +1856,12 @@ impl App {
                     self.do_search();
                 }
                 2 => {
+                    if report_check {
+                        self.smoke_stage = 6;
+                        self.toggle_index_details();
+                        self.send(Command::CleanupSnapshots);
+                        return;
+                    }
                     if std::env::args().any(|a| a == "--exercise-gui-preferences") {
                         self.gui = GuiSettings {
                             scale: 1.25,
@@ -1416,6 +1888,14 @@ impl App {
                     }
                     self.smoke_stage = 3;
                     self.screenshot_at = Some(Instant::now() + Duration::from_secs(2));
+                }
+                6 if report_check => {
+                    self.diagnostic_evidence["displayed_index_report"] = serde_json::to_value(&self.index_details).unwrap_or_default();
+                    self.diagnostic_evidence["displayed_cleanup"] = serde_json::to_value(&self.last_cleanup).unwrap_or_default();
+                    self.diagnostic_evidence["saved_cleanup"] = read_json(&self.o.data.join("last-cleanup.json")).unwrap_or_default();
+                    self.smoke_stage = 4;
+                    self.tab = 1;
+                    self.screenshot_at = Some(Instant::now() + Duration::from_secs(1));
                 }
                 _ => {}
             }
@@ -1450,7 +1930,7 @@ impl App {
                 .map_err(err);
                 let _ = save_json(
                     &self.o.report,
-                    &serde_json::json!({"native_ui":saved,"screenshot":path,"backend":self.backend,"hits":self.hits,"browser_required":false,"library":self.roots,"gui":self.gui,"gui_loaded_on_start":self.loaded_gui,"gui_saved_matches":GuiSettings::load(&self.o.home.join("data/settings.json"))==self.gui,"settings_file":read_json::<serde_json::Value>(&self.o.home.join("data/settings.json")).ok()}),
+                    &serde_json::json!({"native_ui":saved,"screenshot":path,"backend":self.backend,"hits":self.hits,"browser_required":false,"library":self.roots,"gui":self.gui,"gui_loaded_on_start":self.loaded_gui,"gui_saved_matches":GuiSettings::load(&self.o.home.join("data/settings.json"))==self.gui,"settings_file":read_json::<serde_json::Value>(&self.o.home.join("data/settings.json")).ok(),"library_reports":self.diagnostic_evidence}),
                 );
                 match self.smoke_stage {
                     3 => {
@@ -1468,8 +1948,151 @@ impl App {
             }
         }
     }
-    fn interaction_smoke(&mut self, ctx: &egui::Context) {
+    fn feature_gui_check(&mut self, ctx: &egui::Context) {
+        // Exercise a collection kept beside the application as well as the
+        // normal external-collection setup. Never index Refseek's own data.
+        let fixture_source = if std::env::args().any(|s| s == "--inside-app-source") {
+            self.o.home.join("Pictures")
+        } else {
+            self.o.home.parent().unwrap().join(format!("{}-source",
+                self.o.home.file_name().unwrap_or_default().to_string_lossy()))
+        };
+        let other_root = fixture_source.with_extension("other");
+        let branch = fixture_source.join("skip");
+        let nested_root = branch.join("keep");
         if self.error.is_some() || Instant::now() > self.smoke_deadline {
+            let _ = save_json(&self.o.report,&serde_json::json!({"error":self.error,"stage":self.smoke_stage}));
+            self.stop(); return;
+        }
+        if self.ready && !self.busy && !self.searching {
+            match self.smoke_stage {
+                0 => {
+                    self.diagnostic_evidence["new_default_dimension"] = serde_json::json!(self.settings_dimension);
+                    self.smoke_stage = 1; self.send(Command::Dimension(256));
+                },
+                1 => {
+                    self.diagnostic_evidence["empty_library_dimension_change"] = serde_json::json!(self.settings_dimension == 256);
+                    self.smoke_stage = 2; self.send(Command::Dimension(512));
+                },
+                2 => {
+                    let root = fixture_source.clone();
+                    let result = (|| -> Res<()> {
+                        for (name, image) in [("one.jpg","b01-001.jpg"),("skip/two.jpg","b01-014.jpg"),
+                            ("skip/keep/three.jpg","b01-021.jpg")] {
+                            let path = root.join(name);
+                            std::fs::create_dir_all(path.parent().unwrap()).map_err(err)?;
+                            std::fs::copy(self.assets.as_ref().unwrap().join("validation").join(image),path).map_err(err)?;
+                        }
+                        std::fs::create_dir_all(&other_root).map_err(err)?;
+                        std::fs::copy(self.assets.as_ref().unwrap().join("validation/b01-001.jpg"), other_root.join("four.jpg")).map_err(err)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = result {self.error = Some(e); return;}
+                    self.smoke_stage = 3;
+                    self.send(Command::Index(vec![root, nested_root.clone(), other_root.clone()],["image".into()].into_iter().collect()));
+                },
+                3 => {
+                    let root = fixture_source.clone();
+                    self.scope = [key(&root),key(&root.join("skip/keep"))].into_iter().collect();
+                    self.excluded_scope = [key(&root.join("skip"))].into_iter().collect();
+                    self.q.text = "animal".into(); self.do_search(); self.smoke_stage = 4;
+                },
+                4 => {
+                    if self.hits.len() != 2 || self.hits.iter().any(|h| h.path.ends_with("two.jpg")) {
+                        self.error = Some("GUI subfolder query did not preserve the selected rules".into()); return;
+                    }
+                    let visible = |expanded: &HashSet<String>| self.folder_tree.visible_rows(expanded).into_iter()
+                        .map(|(i, depth)| (self.folder_tree.keys[i].clone(), depth)).collect::<Vec<_>>();
+                    let collapsed = visible(&self.expanded_folders);
+                    let opened = visible(&[key(&fixture_source)].into_iter().collect());
+                    let fully_opened = visible(&[key(&fixture_source), key(&branch)].into_iter().collect());
+                    if collapsed.len() != 2 || !collapsed.contains(&(key(&fixture_source), 0)) || !collapsed.contains(&(key(&other_root), 0))
+                        || opened.len() != 3 || !opened.contains(&(key(&branch), 1))
+                        || fully_opened.len() != 4 || !fully_opened.contains(&(key(&nested_root), 2)) {
+                        self.error = Some("Folder tree did not group the nested index beneath its parent".into()); return;
+                    }
+                    self.diagnostic_evidence["folder_tree"] = serde_json::json!({"collapsed":collapsed,"root_opened":opened,"branch_opened":fully_opened});
+                    self.diagnostic_evidence["gui_scope_query"] = serde_json::json!({"included":self.q.roots,
+                        "excluded":self.q.excluded_roots,"hits":self.hits,"folders":self.folder_tree.folders});
+                    self.diagnostic_evidence["folder_storage"] = serde_json::json!(self.roots.iter()
+                        .map(|r| serde_json::json!({"snapshot": r.snapshot, "index_bytes": r.index_bytes, "source_bytes": r.source_bytes}))
+                        .collect::<Vec<_>>());
+                    self.diagnostic_evidence["vector_storage_per_10000"] = serde_json::json!(INDEX_DIMENSIONS.map(|d| (d, vector_storage(10_000, d))));
+                    self.smoke_stage = 5; self.tab = 0;
+                    self.screenshot_at = Some(Instant::now()+Duration::from_secs(1));
+                },
+                7 => {
+                    if !self.hits.is_empty() {self.error = Some("A missing selected subfolder broadened the GUI search".into());return;}
+                    self.diagnostic_evidence["missing_subfolder_does_not_broaden"] = serde_json::json!(true);
+                    self.search_picture_folder(branch.clone());
+                    self.smoke_stage = 9;
+                },
+                9 => {
+                    if self.hits.len() != 1 || !self.hits[0].path.ends_with("two.jpg")
+                        || !self.has_folder_filters() || !self.scope.is_empty() || !self.excluded_scope.is_empty() {
+                        self.error = Some("Folder-only search did not restrict results to the picture's immediate folder".into());return;
+                    }
+                    self.diagnostic_evidence["folder_only_hits"] = serde_json::json!(self.hits);
+                    self.smoke_stage = 10;
+                    self.screenshot_at = Some(Instant::now() + Duration::from_secs(1));
+                },
+                11 => {
+                    // The second root contains a copy of one.jpg; search deduplicates by content.
+                    if self.hits.len() != 3 || !self.hits.iter().any(|h| h.path.ends_with("three.jpg")) || self.has_folder_filters() {
+                        self.error = Some("Search all folders did not restore the full library".into());return;
+                    }
+                    self.diagnostic_evidence["all_folders_hit_count"] = serde_json::json!(self.hits.len());
+                    let _ = save_json(&self.o.report,&self.diagnostic_evidence);
+                    self.stop(); return;
+                },
+                _ => {},
+            }
+        }
+        if self.screenshot_at.is_some_and(|t| Instant::now()>t) {
+            self.screenshot_at = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+        for event in ctx.input(|i| i.events.clone()) {
+            if let egui::Event::Screenshot {image,..} = event {
+                let filename = match self.smoke_stage {
+                    5 => "folder-scope-collapsed.png",
+                    8 => "folder-scope.png",
+                    10 => "folder-only-search.png",
+                    _ => "index-settings.png",
+                };
+                let raw = image.pixels.iter().flat_map(|p|p.to_array()).collect::<Vec<_>>();
+                if let Err(e) = image::save_buffer(self.o.home.join("verification").join(filename),&raw,
+                    image.size[0] as u32,image.size[1] as u32,image::ColorType::Rgba8) {
+                    self.error = Some(e.to_string()); return;
+                }
+                if self.smoke_stage == 5 {
+                    self.expanded_folders = [key(&fixture_source), key(&branch)].into_iter().collect();
+                    self.smoke_stage = 8;
+                    self.screenshot_at = Some(Instant::now()+Duration::from_secs(1));
+                } else if self.smoke_stage == 8 {
+                    self.smoke_stage = 6; self.tab = 2;
+                    self.screenshot_at = Some(Instant::now()+Duration::from_secs(1));
+                } else if self.smoke_stage == 10 {
+                    self.search_all_folders();
+                    self.smoke_stage = 11;
+                } else {
+                    self.diagnostic_evidence["dimension"] = serde_json::json!(self.settings_dimension);
+                    self.diagnostic_evidence["dimension_locked_after_indexing"] = serde_json::json!(self.dimension_locked);
+                    self.diagnostic_evidence["layout"] = serde_json::json!(self.layout_checks);
+                    self.diagnostic_evidence["backend"] = serde_json::json!(self.backend);
+                    self.diagnostic_evidence["settings"] = read_json(&self.o.home.join("data/settings.json")).unwrap_or_default();
+                    self.scope = [key(&fixture_source.join("not-indexed"))].into_iter().collect();
+                    self.excluded_scope.clear();
+                    self.tab = 0;
+                    self.do_search(); self.smoke_stage = 7;
+                }
+            }
+        }
+    }
+    fn interaction_smoke(&mut self, ctx: &egui::Context) {
+        let expected_save_error = matches!(self.smoke_stage, 17 | 18)
+            && std::env::args().any(|a|a=="--index-error-check");
+        if (self.error.is_some() && !expected_save_error) || Instant::now() > self.smoke_deadline {
             let _ = save_json(
                 &self.o.report,
                 &serde_json::json!({"error":self.error,"stage":self.smoke_stage,"evidence":self.diagnostic_evidence}),
@@ -1479,6 +2102,8 @@ impl App {
         }
         match self.smoke_stage {
             0 if self.ready && !self.busy => {
+                self.diagnostic_evidence["index_kinds_on_start"]=serde_json::json!(crate::preferences::INDEX_KINDS.into_iter().filter(|k|self.kinds.contains(*k)).collect::<Vec<_>>());
+                self.diagnostic_evidence["preparation_workers_on_start"]=serde_json::json!(self.prepare_workers);
                 self.smoke_stage = 1;
                 self.send(Command::Index(
                     vec![self.assets.as_ref().unwrap().join("validation")],
@@ -1559,6 +2184,19 @@ impl App {
                 self.smoke_stage = 10;
                 self.screenshot_at = Some(Instant::now() + Duration::from_secs(2));
             }
+            17 if !self.busy && self.error.is_some() => {
+                self.diagnostic_evidence["save_error_progress"] = serde_json::to_value(&self.index_progress).unwrap_or_default();
+                let details = self.load_index_details();
+                self.diagnostic_evidence["save_error_details"] = serde_json::to_value(&details).unwrap_or_default();
+                self.diagnostic_evidence["save_error_terminal"] = serde_json::json!(
+                    self.index_progress.as_ref().is_some_and(|p|p.phase=="Failed")
+                    && details.as_ref().is_ok_and(|s|s.error.is_some() && s.processed>0));
+                self.index_details = Some(details);
+                self.diagnostic_catalog_lock = None;
+                self.tab = 1;
+                self.smoke_stage = 18;
+                self.screenshot_at = Some(Instant::now() + Duration::from_secs(1));
+            }
             _ => {}
         }
         if self.screenshot_at.is_some_and(|at| Instant::now() > at) && !self.searching {
@@ -1583,7 +2221,11 @@ impl App {
                 );
                 let rect =
                     |r: Option<egui::Rect>| r.map(|r| [r.min.x, r.min.y, r.width(), r.height()]);
-                if self.smoke_stage == 10 {
+                if self.smoke_stage == 18 {
+                    let _ = save_json(&self.o.report, &self.diagnostic_evidence);
+                    self.stop();
+                    return;
+                } else if self.smoke_stage == 10 {
                     self.diagnostic_evidence["viewer_before"] =
                         serde_json::json!(rect(self.last_preview_rect));
                     self.diagnostic_evidence["host_before"] =
@@ -1637,6 +2279,27 @@ impl App {
                         serde_json::json!(self.q.ignore_image.is_some());
                     self.diagnostic_evidence["final_index_progress"] =
                         serde_json::to_value(&self.index_progress).unwrap_or_default();
+                    if std::env::args().any(|a|a=="--index-error-check") {
+                        let setup = (|| -> Res<PathBuf> {
+                            use std::os::windows::fs::OpenOptionsExt;
+                            self.diagnostic_catalog_lock = Some(std::fs::OpenOptions::new().read(true).share_mode(3)
+                                .open(self.o.data.join("catalog.json")).map_err(err)?);
+                            let source = self.o.home.join("verification/concurrent-source");
+                            std::fs::copy(source.join("generated-00.png"), source.join("000-save-failure.png")).map_err(err)?;
+                            Ok(source)
+                        })();
+                        match setup {
+                            Ok(source) => {
+                                self.tab = 1;
+                                self.index_details = Some(self.load_index_details());
+                                self.send(Command::Index(vec![source], ["image".into()].into_iter().collect()));
+                                self.smoke_stage = 17;
+                            },
+                            Err(e) => {self.diagnostic_evidence["save_error_setup_error"]=serde_json::json!(e);
+                                let _=save_json(&self.o.report,&self.diagnostic_evidence); self.stop();},
+                        }
+                        return;
+                    }
                     let _ = save_json(&self.o.report, &self.diagnostic_evidence);
                     self.stop();
                     return;
@@ -1780,7 +2443,7 @@ impl eframe::App for App {
                 ui.add_space(18.);
                 ui.heading("Refseek");
                 ui.label(
-                    RichText::new("RUST DESKTOP")
+                    RichText::new(concat!("DESKTOP · ", env!("CARGO_PKG_VERSION")))
                         .small()
                         .color(ui.visuals().hyperlink_color),
                 );

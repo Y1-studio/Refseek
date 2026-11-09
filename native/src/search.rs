@@ -23,6 +23,10 @@ pub struct Query {
     pub negative_weight: f64,
     pub ignore_weight: f64,
     pub roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub excluded_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub only_folder: Option<PathBuf>,
     pub kinds: HashSet<String>,
     pub combine_max: bool,
 }
@@ -40,11 +44,28 @@ impl Default for Query {
             negative_weight: 0.5,
             ignore_weight: 1.,
             roots: vec![],
+            excluded_roots: vec![],
+            only_folder: None,
             kinds: ["image", "text", "document", "audio", "video"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
             combine_max: false,
+        }
+    }
+}
+impl Query {
+    pub fn allows_path(&self, path: &Path) -> bool {
+        if let Some(folder) = &self.only_folder {
+            return path.parent().is_some_and(|parent| parent == folder || key(parent) == key(folder));
+        }
+        let included = self.roots.iter().filter(|r| under(path, r)).map(|r| key(r).len()).max();
+        let excluded = self.excluded_roots.iter().filter(|r| under(path, r)).map(|r| key(r).len()).max();
+        match (included, excluded) {
+            (Some(a), Some(b)) => a > b,
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+            (None, None) => self.roots.is_empty(),
         }
     }
 }
@@ -72,7 +93,7 @@ pub struct Engine {
     pub style_compatible: bool,
 }
 fn mean(v: &[Vec<f64>]) -> Vec<f64> {
-    let mut out = vec![0.; 768];
+    let mut out = vec![0.; v.first().map(Vec::len).unwrap_or(768)];
     for x in v {
         for (i, y) in x.iter().enumerate() {
             out[i] += y / v.len() as f64;
@@ -121,17 +142,19 @@ impl Engine {
         &mut self,
         api: &Api,
         name: &str,
+        dimension: usize,
         cancel: &AtomicBool,
         progress: &dyn Fn(String),
     ) -> Res<Vec<Vec<f64>>> {
-        if let Some(v) = self.bases.get(name) {
+        let tag = format!("{name}:{dimension}");
+        if let Some(v) = self.bases.get(&tag) {
             return Ok(v.clone());
         }
         let all: HashMap<String, Group> = read_json(&self.assets.join("aspects.json"))?;
         let g = all.get(name).ok_or("Unknown aspect")?;
         let fingerprint = hash(
             format!(
-                "native-q8-focus-v1:{}",
+                "native-q8-focus-v2:{dimension}:{}",
                 serde_json::to_string(&g.prompts).map_err(err)?
             )
             .as_bytes(),
@@ -141,8 +164,8 @@ impl Engine {
             .join("calibration")
             .join(format!("{name}-{fingerprint}.json"));
         if let Ok(b) = read_json::<Vec<Vec<f64>>>(&cache) {
-            if !b.is_empty() && b.iter().all(|v| valid(v) && (dot(v, v) - 1.).abs() < 1e-6) {
-                self.bases.insert(name.into(), b.clone());
+            if !b.is_empty() && b.iter().all(|v| v.len() == dimension && v.iter().all(|x| x.is_finite()) && (dot(v, v) - 1.).abs() < 1e-6) {
+                self.bases.insert(tag.clone(), b.clone());
                 return Ok(b);
             }
         }
@@ -156,7 +179,8 @@ impl Engine {
                 (i * 4).min(g.prompts.len()),
                 g.prompts.len()
             ));
-            embedded.extend(api.embed(batch.iter().map(|s| serde_json::json!(s)).collect())?);
+            embedded.extend(api.embed(batch.iter().map(|s| serde_json::json!(s)).collect())?
+                .into_iter().map(|v| if dimension == 768 {v} else {mrl(&v, dimension)}));
         }
         let means = embedded
             .chunks(g.context_count)
@@ -185,7 +209,7 @@ impl Engine {
             return Err("Could not calibrate aspect".into());
         }
         save_json(&cache, &axes)?;
-        self.bases.insert(name.into(), axes.clone());
+        self.bases.insert(tag, axes.clone());
         Ok(axes)
     }
     fn image(&self, api: &Api, p: &Path, records: &[Record]) -> Res<(Vec<f64>, String)> {
@@ -207,6 +231,13 @@ impl Engine {
         if records.is_empty() {
             return Err("The native library is empty. Add a folder in Library & indexing.".into());
         }
+        let trained_mode = q.image.is_some() && q.aspect == "style" && q.method != "baseline" && q.strength > 0.;
+        // Ordinary similarity, text and exclusions use the index dimension.
+        // Only the frozen trained-style image channel retains its 768d input.
+        let dimension = lib.dimension;
+        let resize = |v: Vec<f64>| if dimension == 768 {v} else {mrl(&v, dimension)};
+        let gallery_vectors = records.iter().map(|r| if dimension == 768 {r.vector.clone()}
+            else {r.search_vector.clone()}).collect::<Vec<_>>();
         let wants = q
             .text
             .lines()
@@ -222,21 +253,21 @@ impl Engine {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Search cancelled".into());
             }
-            texts.push(self.text(api, s)?);
+            texts.push(resize(self.text(api, s)?));
         }
         let text = if texts.is_empty() {
             None
         } else {
             Some(unit(&mean(&texts)))
         };
-        let (image, image_hash) = if let Some(p) = &q.image {
+        let (image, image_hash, native_image) = if let Some(p) = &q.image {
             let (v, h) = self.image(api, p, &records)?;
-            (Some(v), Some(h))
+            (Some(resize(v.clone())), Some(h), Some(v))
         } else {
-            (None, None)
+            (None, None, None)
         };
         let ignore = if let Some(p) = &q.ignore_image {
-            Some(self.image(api, p, &records)?.0)
+            Some(resize(self.image(api, p, &records)?.0))
         } else {
             None
         };
@@ -248,7 +279,7 @@ impl Engine {
             .filter(|s| !s.is_empty())
             .take(20)
         {
-            negatives.push(self.text(api, s)?);
+            negatives.push(resize(self.text(api, s)?));
         }
         let negative = if negatives.is_empty() {
             None
@@ -262,7 +293,7 @@ impl Engine {
         } else {
             q.image_weight
         };
-        let mut blend = vec![0.; 768];
+        let mut blend = vec![0.; dimension];
         if let Some(v) = &image {
             for (i, x) in v.iter().enumerate() {
                 blend[i] += alpha * x;
@@ -275,7 +306,7 @@ impl Engine {
         }
         let norm = dot(&blend, &blend).sqrt().max(1e-12);
         let focused = image.is_some() && q.aspect != "similarity" && q.strength > 0.;
-        let trained = focused && q.aspect == "style" && q.method != "baseline";
+        let trained = trained_mode;
         if trained && !self.style_compatible {
             return Err(
                 "Trained styles are unavailable because the live model probes did not pass".into(),
@@ -289,6 +320,7 @@ impl Engine {
                 } else {
                     &q.aspect
                 },
+                dimension,
                 cancel,
                 progress,
             )?)
@@ -296,14 +328,14 @@ impl Engine {
             None
         };
         let tag = if trained {
-            format!("style:{}", q.method)
+            format!("style:{}:{dimension}", q.method)
         } else if focused {
-            format!("focus:{}", q.aspect)
+            format!("focus:{}:{dimension}", q.aspect)
         } else {
             String::new()
         };
         let feature_query = if trained {
-            Some(self.styles.get(&q.method).project(image.as_ref().unwrap()))
+            Some(self.styles.get(&q.method).project(native_image.as_ref().unwrap()))
         } else if let Some(b) = &basis {
             Some(channel(image.as_ref().unwrap(), b, q.aspect == "subject"))
         } else {
@@ -319,11 +351,11 @@ impl Engine {
             let features = if trained {
                 self.styles
                     .get(&q.method)
-                    .project_batch(&records.iter().map(|r| r.vector.clone()).collect::<Vec<_>>())
+                    .project_batch(&records.iter().map(|r|r.vector.clone()).collect::<Vec<_>>())
             } else {
-                records
+                gallery_vectors
                     .iter()
-                    .map(|r| channel(&r.vector, basis.as_ref().unwrap(), q.aspect == "subject"))
+                    .map(|v| channel(v, basis.as_ref().unwrap(), q.aspect == "subject"))
                     .collect()
             };
             if self.gallery.len() > 3 {
@@ -338,7 +370,7 @@ impl Engine {
                 return Err("Search cancelled".into());
             }
             if !q.kinds.contains(&r.kind)
-                || (!q.roots.is_empty() && !q.roots.iter().any(|root| under(&r.path, root)))
+                || !q.allows_path(&r.path)
             {
                 continue;
             }
@@ -348,10 +380,11 @@ impl Engine {
             if image_hash.as_ref().is_some_and(|h| *h == r.hash) {
                 continue;
             }
-            let ic = image.as_ref().map(|v| dot(v, &r.vector)).unwrap_or(0.);
-            let tc = text.as_ref().map(|v| dot(v, &r.vector)).unwrap_or(0.);
+            let vector = &gallery_vectors[i];
+            let ic = image.as_ref().map(|v| dot(v, vector)).unwrap_or(0.);
+            let tc = text.as_ref().map(|v| dot(v, vector)).unwrap_or(0.);
             let ordinary = if image.is_none() && q.combine_max {
-                texts.iter().map(|v| dot(v, &r.vector)).fold(-1., f64::max)
+                texts.iter().map(|v| dot(v, vector)).fold(-1., f64::max)
             } else {
                 (alpha * ic + (1. - alpha) * tc) / norm
             };
@@ -359,7 +392,8 @@ impl Engine {
                 let mut aspect = dot(feature_query.as_ref().unwrap(), &features.unwrap()[i]);
                 if trained {
                     let w = self.styles.get(&q.method).weight;
-                    aspect = (1. - w) * ic + w * aspect;
+                    let full_image_similarity = dot(native_image.as_ref().unwrap(), &r.vector);
+                    aspect = (1. - w) * full_image_similarity + w * aspect;
                 }
                 let target = alpha * aspect + (1. - alpha) * tc;
                 (1. - q.strength) * ordinary + q.strength * target
@@ -368,11 +402,11 @@ impl Engine {
             };
             let penalty = negative
                 .as_ref()
-                .map(|v| q.negative_weight * dot(v, &r.vector))
+                .map(|v| q.negative_weight * dot(v, vector))
                 .unwrap_or(0.)
                 + ignore
                     .as_ref()
-                    .map(|v| q.ignore_weight * dot(v, &r.vector))
+                    .map(|v| q.ignore_weight * dot(v, vector))
                     .unwrap_or(0.);
             hits.push((
                 r.hash.clone(),

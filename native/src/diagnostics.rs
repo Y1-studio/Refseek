@@ -135,7 +135,53 @@ pub fn storage(
     if !cancelled.cancelled || reload.all().len() != 4 {
         return Err("Cancelled scan lost records".into());
     }
+    let cleanup = snapshot_retention(lib)?;
     Ok(
-        serde_json::json!({"initial":first,"unchanged_rescan":rescan,"cross_folder_reuse":cross,"nested_root_split":split,"failed_replacement":failed,"previous_vector_preserved":retained,"cancelled_scan":cancelled,"reload_records":reload.all().len(),"roots":reload.infos(),"passed":true}),
+        serde_json::json!({"initial":first,"unchanged_rescan":rescan,"cross_folder_reuse":cross,"nested_root_split":split,"failed_replacement":failed,"previous_vector_preserved":retained,"cancelled_scan":cancelled,"reload_records":reload.all().len(),"roots":reload.infos(),"cleanup":cleanup,"passed":true}),
     )
+}
+
+fn snapshot_retention(mut lib: Library) -> Res<serde_json::Value> {
+    use crate::store::cleanup_snapshots;
+    let active = lib.dir.join("catalog.json");
+    let previous = lib.dir.join("catalog.previous.json");
+    let mut changed = Vec::new();
+    for i in 0..4 {
+        lib.roots[0].records[0].snippet = format!("checkpoint {i}");
+        lib.commit()?;
+        changed.push(lib.roots[0].info.snapshot.clone());
+    }
+    if changed[..2].iter().any(|p| lib.dir.join(p).exists())
+        || changed[2..].iter().any(|p| !lib.dir.join(p).is_dir()) {
+        return Err("Checkpoint retention did not keep exactly the two referenced generations".into());
+    }
+    let a = std::fs::read(&active).map_err(err)?;
+    let b = std::fs::read(&previous).map_err(err)?;
+    lib.commit()?;
+    if std::fs::read(&previous).map_err(err)? != b || std::fs::read(&active).map_err(err)? != a {
+        return Err("Unchanged commit rotated the catalogs".into());
+    }
+    let shard = lib.dir.join(&changed[3]).parent().unwrap().to_owned();
+    let old = shard.join(stamp().to_string());
+    std::fs::create_dir(&old).map_err(err)?;
+    let bytes = std::fs::copy(lib.dir.join(&changed[3]).join("vectors.f32"), old.join("vectors.f32")).map_err(err)?;
+    let unknown = shard.join("0");
+    std::fs::create_dir(&unknown).map_err(err)?;
+    std::fs::write(unknown.join("keep.txt"), "not a Refseek snapshot").map_err(err)?;
+    let preview = cleanup_snapshots(&lib.dir, true)?;
+    if preview.candidates != 1 || preview.candidate_bytes != bytes || !old.is_dir() {
+        return Err("Cleanup preview did not identify exactly the old snapshot".into());
+    }
+    atomic(&previous, b"invalid catalog")?;
+    let refused = cleanup_snapshots(&lib.dir, false).is_err() && old.is_dir();
+    atomic(&previous, &b)?;
+    if !refused { return Err("Cleanup did not fail closed on an invalid recovery catalog".into()); }
+    let result = cleanup_snapshots(&lib.dir, false)?;
+    if result.removed != 1 || result.freed_bytes != bytes || old.exists() || !unknown.join("keep.txt").is_file()
+        || std::fs::read(&active).map_err(err)? != a || std::fs::read(&previous).map_err(err)? != b
+        || Library::open(&lib.dir)?.all().len() != 4 {
+        return Err("Cleanup did not preserve the active/recovery data and unrelated files".into());
+    }
+    Ok(serde_json::json!({"automatic_retention":true,"unchanged_commit_preserved_recovery":true,
+        "invalid_recovery_refused":true,"preview":preview,"cleanup":result}))
 }

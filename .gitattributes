@@ -7,3 +7,5 @@
 *.json text eol=lf
 *.ps1 text eol=crlf
 *.txt text eol=crlf
+# This resource is hash-locked byte-for-byte with the packaged asset bundle.
+native/assets/assets-manifest.json -text

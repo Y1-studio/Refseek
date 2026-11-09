@@ -4,7 +4,7 @@ Search your own art and reference folders with a description, an example image, 
 
 ## Download for Windows
 
-Choose an app from the [latest release](https://github.com/Y1-studio/Refseek/releases/latest). Both downloads include the model. You don't need to install Python, Rust, or a separate model server.
+Version **2.2.0** is available for both editions. Choose an app from the [latest release](https://github.com/Y1-studio/Refseek/releases/latest). Both downloads include the model. You don't need to install Python, Rust, or a separate model server.
 
 | Download | Interface |
 | --- | --- |
@@ -28,6 +28,18 @@ Style starts with the **Contrastive style adapter**. Style and pose matches are 
 
 Use **+ Want** for more descriptions. Add a negative image to push similar results down, exclude concepts, or limit the folders searched. You can search saved work while indexing continues. In the preview, arrow keys move between pictures without resizing the window.
 
+Both editions offer **Include / Skip** rules in an expandable folder tree, a shortcut to search only a picture's folder, and an **Index dimensions** setting. New libraries default to 768 dimensions. Existing libraries keep their saved dimension. The trained Style methods retain full vectors at smaller search dimensions.
+
+## What changed in 2.2
+
+**Faster folder updates:** saved paths, sizes and modification times let unchanged files skip reading, resizing and embedding. Refseek still scans directories to find new or removed files. Use **Verify file contents** when an edit may have preserved both the size and modification time.
+
+**Remembered indexing choices:** both editions start with images selected and two CPU preparation workers. Change the file types or worker count and Refseek remembers them. Image preparation runs ahead of model inference through a bounded queue. Desktop includes an optimized resize path; Browser overlaps two embedding requests.
+
+**Safer saved work:** completed files are checkpointed. Failed or cancelled replacements keep previous vectors, incomplete scans cannot publish removals, and snapshot verification protects publication and cleanup. An unchanged update leaves both saved catalogs intact.
+
+Read the [2.2.0 release notes](docs/RELEASE_NOTES.md) for the complete changes, upgrade steps and verification limits. The bundled models and trained style weights are unchanged.
+
 ## Desktop screenshots
 
 [![Desktop search with a reference image and description](docs/screenshots/search.png)](docs/screenshots/search.png)
@@ -46,7 +58,7 @@ Click an image for full size. These captures show the Rust app with [demo illust
 
 Close the old app, put the new EXE in the same folder, and keep the existing data folder. Update shortcuts if the EXE's name has changed.
 
-The desktop app saves its catalogue and settings in `data` beside the EXE. The browser app uses `Refseek-Browser-data`; it reuses `SemanticSearch-v2-data` when that older folder exists and the new folder doesn't. Keep the two editions in separate application folders. Their catalogues are independent, even when they search the same pictures.
+Put both EXEs beside the same `data` folder. The desktop app uses `data/library` for its index. Browser uses `data/browser` for its index and accounts, with `.env` at `data/.env`. The two catalogues are independent, even when they search the same pictures. Browser can move an older portable library into this layout without reindexing.
 
 ## Guides and source
 

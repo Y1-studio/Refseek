@@ -129,3 +129,22 @@ pub fn merge(path: &Path, key: &str, value: serde_json::Value) -> Res<()> {
     object.insert(key.into(), value);
     save_json(path, &all)
 }
+
+// Indexing choices live beside the other preferences and survive GUI saves.
+pub const INDEX_KINDS:[&str;5]=["image","text","document","audio","video"];
+pub fn index_kinds(path:&Path)->std::collections::HashSet<String> {
+    let settings:serde_json::Value=read_json(path).unwrap_or_default();
+    match settings["index_kinds"].as_array() {
+        Some(values) if values.iter().all(|v|v.is_string()) => values.iter()
+            .filter_map(|v|v.as_str()).filter(|v|INDEX_KINDS.contains(v)).map(str::to_string).collect(),
+        _ => ["image".into()].into_iter().collect(),
+    }
+}
+pub fn save_index_kinds(path:&Path,kinds:&std::collections::HashSet<String>)->Res<()> {
+    let ordered=INDEX_KINDS.into_iter().filter(|k|kinds.contains(*k)).collect::<Vec<_>>();
+    merge(path,"index_kinds",serde_json::json!(ordered))
+}
+pub fn preparation_workers(settings:&serde_json::Value)->usize {
+    settings["prepare_workers"].as_u64().map(|n|n.min(crate::image_pipeline::maximum_workers() as u64) as usize)
+        .unwrap_or_else(||crate::image_pipeline::worker_count(crate::image_pipeline::DEFAULT_WORKERS))
+}

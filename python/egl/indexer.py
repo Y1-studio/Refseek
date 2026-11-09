@@ -1,481 +1,414 @@
 from __future__ import annotations
 
+import hashlib
+import math
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from array import array
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import nullcontext
 from pathlib import Path
 
-from .api import ApiError, EmbedClient, l2norm, media_item
+from .api import ApiError, EmbedClient, IndexCancelled, l2norm, media_item
 from .config import Settings
 from .scan import INDEX_KINDS, scan_folder
 from .store import Index
-from .textio import chunk_text, is_media, mime_of, read_file, shrink_image
+from .textio import chunk_text, is_media, mime_of, prepare_image, read_file
 
 
 class Indexer:
     def __init__(self, settings: Settings, client: EmbedClient, log=print):
-        self.s = settings
-        self.client = client
-        self.log = log
+        self.s, self.client, self.log = settings, client, log
 
-    def index_roots(self) -> list[str]:
+    def index_roots(self):
         return Index.load(self.s.data_dir).roots or []
 
-    def _scan_roots(self, roots, required=None) -> tuple[dict, list]:
-        states: dict[str, dict] = {}
-        skipped: list[tuple[Path, str]] = []
-        required_set = {str(r) for r in (required or [])}
+    def _scan_roots(self, roots, required=None, cancel=None):
+        states, skipped = {}, []
+        required = {str(r) for r in (required or [])}
         for root in roots:
+            if cancel and cancel():
+                raise IndexCancelled('Indexing cancelled during scanning')
             if not root.exists():
-                if str(root) in required_set:
-                    raise FileNotFoundError(f"folder not found: {root}")
+                if str(root) in required:
+                    raise FileNotFoundError(f'folder not found: {root}')
                 continue
-            root_states, root_skipped = scan_folder(root, self.s)
-            states.update(root_states)
-            skipped.extend(root_skipped)
+            found, omitted = scan_folder(root, self.s, cancel)
+            states.update(found)
+            skipped.extend(omitted)
         return states, skipped
 
-    def capabilities(self) -> dict:
+    def capabilities(self):
         try:
-            data = self.client.get("/capabilities")
-            if isinstance(data, dict):
-                return data
+            result = self.client.get('/capabilities')
+            if isinstance(result, dict):
+                return result
+        except IndexCancelled:
+            raise
         except Exception:
             pass
         return {}
 
-    def run(self, folders, media="auto", kinds=None, rescan=False, cancel=None) -> dict:
-        started = time.time()
-        if isinstance(folders, (str, Path)):
-            folders = [folders]
-        if isinstance(kinds, str):
-            kinds = [k for k in kinds.replace(";", ",").split(",") if k.strip()]
-        scan_roots: list[Path] = []
-        seen_roots = set()
-        extra = list(self.index_roots()) if rescan else []
-        for folder in list(folders) + extra:
-            root = Path(folder).expanduser().resolve()
-            if str(root) in seen_roots:
-                continue
-            seen_roots.add(str(root))
-            scan_roots.append(root)
+    def run(self, folders, media='auto', kinds=None, rescan=False, cancel=None, verify_contents=False):
+        started = time.monotonic()
+        explicit_kinds = kinds is not None
+        stop = threading.Event()
+
+        def stopped():
+            return stop.is_set() or bool(cancel() if callable(cancel) else cancel)
+
+        def check():
+            if stopped():
+                raise IndexCancelled('Indexing cancelled; previous file vectors retained')
+
+        def scope():
+            return self.client.cancel_scope(stopped) if hasattr(self.client, 'cancel_scope') else nullcontext()
+
         index = Index.load(self.s.data_dir)
-        original_records,original_vectors=index.records,index.vectors
-        initial_total = len(index.records)
-        if self.log:
-            self.log(f"scanning {len(scan_roots)} folder(s)…")
-        states, skipped = self._scan_roots(scan_roots, required=[Path(f).expanduser().resolve() for f in folders])
-        available_roots=[root for root in scan_roots if root.exists()]
-        allowed = None
-        if kinds is not None:
-            allowed = {str(k).strip().lower() for k in kinds if str(k).strip()}
-            if "all" in allowed:
-                allowed = set(INDEX_KINDS)
-            unknown = sorted(allowed - set(INDEX_KINDS))
-            if unknown:
-                raise ApiError(f"unknown file type(s): {', '.join(unknown)} (known: {', '.join(INDEX_KINDS)})")
-            if allowed == set(INDEX_KINDS):
-                allowed = None
-        elif index.kind_filter:
-            allowed = {str(k).lower() for k in index.kind_filter}
-        kinds_excluded = 0
-        if allowed is not None:
-            kept = {p: st for p, st in states.items() if st["kind"] in allowed}
-            kinds_excluded = len(states) - len(kept)
-            states = kept
-        caps = self.capabilities()
-
-        def media_allowed(kind: str) -> bool:
-            if kind == "image":
-                return bool(caps.get("image", True))
-            if media == "off":
-                return False
-            if media == "on":
-                return True
-            return bool(caps.get(kind, False))
-
-        old_states = index.file_states()
-        unchanged = {
-            p: st
-            for p, st in states.items()
-            if p in old_states
-            and old_states[p].get("mtime_ns") == st["mtime_ns"]
-            and old_states[p].get("size") == st["size"]
-            and old_states[p].get("kind") == st["kind"]
-        }
-
+        if not index.records:
+            from .dimensions import preferred_dimension, DEFAULT_DIMENSION
+            requested = preferred_dimension(self.s.data_dir)
+            index.search_dim = requested if requested != DEFAULT_DIMENSION else None
+        original_records, original_vectors = index.records, index.vectors
         by_path = index.records_by_path()
-        keep_records, keep_vectors = [], []
-        obsolete = 0
-        for path, idxs in by_path.items():
-            if path in unchanged:
-                for i in idxs:
-                    keep_records.append(index.records[i])
-                    keep_vectors.append(index.vectors[i])
-            elif path in states:
-                pass  # changed file -> re-embedded below via planned
-            elif _under_any(path, available_roots):
-                obsolete += len(idxs)
-            else:
-                for i in idxs:  # outside the scanned scope (rescan=False) -> keep
-                    keep_records.append(index.records[i])
-                    keep_vectors.append(index.vectors[i])
-
-        planned = [p for p in states if p not in unchanged]
-
-        def _build(idx):
-            path = planned[idx]
-            p = Path(path)
-            kind = states[path]["kind"]
-            if is_media(kind) and not media_allowed(kind):
-                return (idx, None, (p, f"{kind} not supported by this API"))
-            try:
-                file_root = _root_of(p, scan_roots)
-                if is_media(kind):
-                    job = self._media_job(p, kind, states[path], file_root)
-                else:
-                    job = self._text_job(p, kind, states[path], file_root)
-                return (idx, job, None)
-            except Exception as e:
-                return (idx, None, (p, f"{type(e).__name__}: {e}"))
-
-        built = [None] * len(planned)
-        if planned:
-            workers = max(1, self.s.threads)
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                n_done = 0
-                for idx, jb, sk in ex.map(_build, range(len(planned))):
-                    built[idx] = jb
-                    if sk is not None:
-                        skipped.append(sk)
-                    n_done += 1
-                    if self.log is not None and len(planned) > 500 and n_done % 500 == 0:
-                        self.log(f"  prepared {n_done}/{len(planned)}")
-        jobs = [b for b in built if b]
-
-        flat: list = []
-        item_job: list[int] = []
-        for ji, job in enumerate(jobs):
-            job["offset"] = len(flat)
-            flat.extend(job["items"])
-            item_job.extend([ji] * len(job["items"]))
-        total_items = len(flat)
-        results: list = [None] * total_items
-        bs = max(1, self.s.batch)
-        batches = [flat[i : i + bs] for i in range(0, total_items, bs)]
-        errors: list[str] = []
-        if self.log and (total_items or jobs):
-            self.log(f"preparing {total_items} items from {len(planned)} pending files…")
-
-        def run_batch(batch):
-            return self.client.embed(batch, len(batch))
-
-        done = [False] * total_items
-        remaining = [len(j["items"]) for j in jobs]
-        progress = _Progress(self.log, total_items, len(jobs))
-        new_records, new_vectors = [], []
-        drained = [False] * len(jobs)
-        dim = None
-        unsupported: list[Path] = []
-
-        def assemble(ji):
-            """(records, vectors) for a fully-embedded job, else None. Raises on dim change."""
-            nonlocal dim
-            job = jobs[ji]
-            if not job["items"]:
-                return None
-            vecs = results[job["offset"] : job["offset"] + len(job["items"])]
-            if any(v is None for v in vecs):
-                return None
-            if dim is None:
-                dim = len(vecs[0])
-                if index.dim and index.dim != dim:
-                    raise ApiError(
-                        f"API returned {dim}-dim vectors but the index has {index.dim}-dim. "
-                        "Run 'python run.py reset' and re-index with matching dimensions."
-                    )
-            if is_media(job["kind"]):
-                records, vectors = [job["record"]()], [l2norm(vecs[0])]
-            else:
-                records, vectors = job["records"], [l2norm(v) for v in vecs]
-                if len(records) > len(vectors):
-                    records = records[: len(vectors)]
-            return records, vectors
-
-        def drain():
-            """Move fully-embedded jobs into new_records. Returns completed file count."""
-            n = 0
-            for ji, job in enumerate(jobs):
-                if drained[ji]:
-                    continue
-                if job["items"] and remaining[ji] > 0:
-                    continue
-                drained[ji] = True
-                out = assemble(ji)
-                if out is None:
-                    unsupported.append(job["path"])
-                    continue
-                records, vectors = out
-                for rec, vec in zip(records, vectors):
-                    new_records.append(rec)
-                    new_vectors.append(vec)
-                n += 1
-            return n
-
-        ck_files = max(0, self.s.checkpoint_files)
-        ck_secs = max(0, self.s.checkpoint_secs)
-        last_ck = time.time()
-        since_ck = 0
-        last_drained_files = -1
-
-        def store():
-            replaced={r['path'] for r in new_records}
-            # Keep the previous versions of changed files until their entire
-            # replacements are embedded. Failed/cancelled files remain searchable.
-            pending=[i for path,ids in by_path.items() if path in states and path not in unchanged and path not in replaced for i in ids]
-            fallback_records=[original_records[i] for i in pending]
-            fallback_vectors=[original_vectors[i] for i in pending]
-            index.records = keep_records + fallback_records + new_records
-            index.vectors = keep_vectors + fallback_vectors + new_vectors
-            if dim:
-                index.dim = dim
-            index.set_state(self.s.model, self.client.api_type,
-                            {str(r) for r in scan_roots} | set(index.roots or []),
-                            kind_filter=sorted(allowed) if allowed is not None else None)
-            index.save()
-
-        def maybe_checkpoint(force=False):
-            nonlocal last_ck, since_ck, last_drained_files
-            if force or progress.files_done != last_drained_files:
-                last_drained_files = progress.files_done
-                since_ck += drain()
-            due = force or (ck_files and since_ck >= ck_files) \
-                or (ck_secs and time.time() - last_ck >= ck_secs)
-            if force or (due and since_ck):
-                has_fallback=any(path in states and path not in unchanged for path in by_path)
-                if not keep_records and not new_records and not has_fallback and initial_total:
-                    raise ApiError(
-                        "nothing embeddable in this run — refusing to wipe the existing "
-                        f"index ({initial_total} vectors). Use forget to delete folders, "
-                        "or check the folder paths / file-type filter.")
-                store()
-                if self.log and since_ck:
-                    self.log(f"  checkpoint: {len(new_records)} vectors on disk")
-                since_ck = 0
-                last_ck = time.time()
-
-        def is_cancelled():
-            try:
-                return bool(cancel() if callable(cancel) else cancel)
-            except Exception:
-                return False
-
+        initial_total = len(original_records)
+        folders = [folders] if isinstance(folders, (str, Path)) else list(folders)
+        required = [Path(f).expanduser().resolve() for f in folders]
+        roots = list(dict.fromkeys(required + ([Path(r) for r in index.roots] if rescan else [])))
+        target_roots = set(map(str, roots)) | set(index.roots or [])
+        available = [root for root in roots if root.exists()]
+        from .index_preferences import load, cpu_limit
+        saved = load(self.s.data_dir, fallback_kinds=index.kind_filter or ['image'], fallback_workers=self.s.threads)
+        if kinds is None:
+            kinds = saved['kinds'] if (Path(self.s.data_dir) / 'index-preferences.json').exists() else (index.kind_filter or self.s.index_kinds or 'image')
+        if isinstance(kinds, str):
+            kinds = [k.strip().lower() for k in kinds.replace(';', ',').split(',') if k.strip()]
+        allowed = set(kinds)
+        if 'all' in allowed:
+            allowed = set(INDEX_KINDS)
+        if not allowed or allowed - set(INDEX_KINDS):
+            raise ApiError('Select at least one known file type to index')
+        desired_filter = None if allowed == set(INDEX_KINDS) else sorted(allowed)
+        changed_metadata = (set(index.roots) != target_roots or index.kind_filter != desired_filter
+                            or index.model != self.s.model or index.api_type != self.client.api_type)
+        skipped, errors, warnings = [], [], []
+        replacements = {}
+        unchanged = {}
+        states = {}
+        obsolete = set()
+        checkpoints = 0
+        last_saved = 0
+        last_checkpoint = time.monotonic()
+        processed = 0
         cancelled = False
-        ex = None
+        interrupted = False
+        workers = max(1, min(self.s.threads, cpu_limit()))
+        window = workers + 1
+        if explicit_kinds:
+            from .index_preferences import save
+            save(self.s.data_dir, kinds=sorted(allowed), prepare_workers=workers)
+        max_prepared = 0
+        max_inflight = 0
+
+        def result():
+            added = sum(len(rows) for rows, _ in replacements.values())
+            return dict(files_scanned=len(states), unchanged=len(unchanged), planned=len(states)-len(unchanged),
+                        indexed_files=len(replacements), vectors_added=added, vectors_total=len(index.records),
+                        dropped=sum(len(by_path[p]) for p in obsolete) if not cancelled else 0,
+                        kinds_excluded=kinds_excluded, kinds_filter=desired_filter, rescan=bool(rescan),
+                        cancelled=cancelled, skipped=skipped, errors=errors[:5], warnings=warnings,
+                        seconds=round(time.monotonic()-started, 3), checkpoints=checkpoints,
+                        preparation_workers=workers, embedding_requests=2, preparation_window=window,
+                        max_preparation_pending=max_prepared, max_embedding_pending=max_inflight,
+                        processed_files=len(unchanged)+processed, verify_contents=bool(verify_contents))
+
+        def publish(complete=False):
+            nonlocal checkpoints, last_saved, last_checkpoint
+            # Deletions/filter changes are applied only after a completed scan/job.
+            # Partial checkpoints retain every previous file not fully replaced.
+            records, vectors = [], []
+            for path, ids in by_path.items():
+                if path in replacements or (complete and path in obsolete):
+                    continue
+                records.extend(original_records[i] for i in ids)
+                vectors.extend(original_vectors[i] for i in ids)
+            for rows, values in replacements.values():
+                records.extend(rows)
+                vectors.extend(values)
+            if not records and initial_total:
+                raise ApiError('Nothing embeddable in this run; refusing to wipe the existing index. Use Forget to remove folders.')
+            if len(replacements) == last_saved and not (complete and (changed_metadata or obsolete)):
+                return
+            index.records, index.vectors = records, vectors
+            index.set_state(self.s.model, self.client.api_type, target_roots,
+                            kind_filter=desired_filter if complete else index.kind_filter)
+            index.save()
+            for warning in index.last_save.get('warnings', []):
+                if warning not in warnings:
+                    warnings.append(warning)
+            checkpoints += 1
+            last_saved = len(replacements)
+            last_checkpoint = time.monotonic()
+            if self.log:
+                self.log(f'  checkpoint: {sum(len(x[0]) for x in replacements.values())} vectors on disk')
+
+        def await_result(future):
+            while True:
+                check()
+                try:
+                    return future.result(timeout=.05)
+                except FutureTimeout:
+                    continue
+
+        kinds_excluded = 0
         try:
-            if batches:
-                ex = ThreadPoolExecutor(max_workers=max(1, self.s.threads))
-                future_to_batch = {ex.submit(run_batch, b): (fi, b) for fi, b in enumerate(batches)}
-                for fut in as_completed(future_to_batch):
-                    fi, batch = future_to_batch[fut]
-                    base = fi * bs
+            check()
+            if self.log:
+                self.log(f'scanning {len(roots)} folder(s)…')
+            all_states, skipped = self._scan_roots(roots, required, stopped)
+            states = {p: st for p, st in all_states.items() if st['kind'] in allowed}
+            kinds_excluded = len(all_states)-len(states)
+            skipped_paths = {str(p) for p, _ in skipped}
+            old = index.file_states()
+            for path, st in states.items():
+                check()
+                prior = old.get(path)
+                if (prior and all(prior.get(k) == st[k] for k in ('mtime_ns', 'size', 'kind'))
+                    and not (not is_media(st['kind']) and prior['n'] >= self.s.max_chunks)):
+                    if not verify_contents or (prior.get('sha256') and _file_hash(Path(path), check) == prior['sha256']):
+                        unchanged[path] = st
+            obsolete = {p for p in by_path if p not in states and p not in skipped_paths and _under_any(p, available)}
+            planned = [p for p in states if p not in unchanged]
+            if not planned:
+                check()
+                publish(complete=True)
+                return result()
+            with scope():
+                caps = self.capabilities()
+        except IndexCancelled:
+            cancelled = True
+            return result()
+
+        def build(i):
+            check()
+            path = Path(planned[i]);st = states[str(path)];kind = st['kind']
+            if kind in ('audio', 'video') and (media == 'off' or (media == 'auto' and not caps.get(kind, False))):
+                raise ValueError(f'{kind} not supported by this API')
+            if kind == 'image' and not caps.get('image', True):
+                raise ValueError('image not supported by this API')
+            _same_file(path, st)
+            root = _root_of(path, roots)
+            job = self._media_job(path, kind, st, root) if is_media(kind) else self._text_job(path, kind, st, root)
+            _same_file(path, st)
+            check()
+            return job
+
+        def embed(job):
+            with scope():
+                values = []
+                # Large image arrays did not improve throughput. Keep each image
+                # independent; text still uses the configured chunk batch size.
+                size = 1 if is_media(job['kind']) else max(1, self.s.batch)
+                for offset in range(0, len(job['items']), size):
+                    check()
+                    part = job['items'][offset:offset+size]
                     try:
-                        vecs = fut.result()
-                        for j, v in enumerate(vecs):
-                            if base + j < total_items:
-                                results[base + j] = v
-                                progress.mark_done(base + j, done, item_job, remaining)
-                    except Exception as e:
-                        errors.append(str(e))
-                        for j, item in enumerate(batch):
-                            if base + j >= total_items:
-                                break
-                            try:
-                                results[base + j] = self.client.embed_one(item)
-                                progress.mark_done(base + j, done, item_job, remaining)
-                            except Exception:
-                                pass
-                    progress.show()
-                    maybe_checkpoint()
-                    if is_cancelled():
-                        cancelled = True
-                        break
-            progress.finish()
+                        chunk = self.client.embed(part, len(part))
+                        if len(chunk) != len(part):
+                            raise ApiError('Incomplete embedding response')
+                    except IndexCancelled:
+                        raise
+                    except Exception:
+                        chunk = []
+                        for item in part:
+                            check()
+                            chunk.append(self.client.embed_one(item))
+                    values.extend(chunk)
+                check()
+                return values
+
+        prep = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='image-preparation')
+        net = ThreadPoolExecutor(max_workers=2, thread_name_prefix='embedding-request')
+        prepared, pending = deque(), deque()
+        next_build = 0
+        progress = _Progress(self.log, len(planned))
+
+        def fill():
+            nonlocal next_build, max_prepared, max_inflight, processed
+            while len(pending) < 2:
+                while next_build < len(planned) and len(prepared) < window:
+                    prepared.append((next_build, prep.submit(build, next_build)))
+                    next_build += 1
+                    max_prepared = max(max_prepared, len(prepared))
+                if not prepared:
+                    break
+                i, future = prepared.popleft()
+                try:
+                    job = await_result(future)
+                except IndexCancelled:
+                    raise
+                except Exception as exc:
+                    skipped.append((Path(planned[i]), f'{type(exc).__name__}: {exc}'))
+                    processed += 1
+                    progress.advance()
+                    continue
+                pending.append((i, job, net.submit(embed, job)))
+                max_inflight = max(max_inflight, len(pending))
+
+        try:
+            if self.log:
+                self.log(f'preparing up to {window} files ahead of 2 embedding requests…')
+            fill()
+            while pending:
+                i, job, future = pending.popleft()
+                try:
+                    values = await_result(future)
+                    check()
+                    _same_file(job['path'], states[str(job['path'])])
+                    if _file_hash(job['path'], check) != job['sha256']:
+                        raise ValueError('File changed during indexing; previous vectors retained')
+                    if len(values) != len(job['items']):
+                        raise ApiError('Incomplete embedding response; previous vectors retained')
+                    dimension = index.dim or self.s.dim or len(values[0])
+                    if any(not _valid_vector(v, dimension) for v in values):
+                        raise ApiError('Invalid/mismatched embedding dimensions; previous vectors retained')
+                    rows = [job['record']()] if is_media(job['kind']) else job['records']
+                    if len(rows) != len(values):
+                        raise ApiError('Incomplete file embedding; previous vectors retained')
+                    # Compact float64 buffers preserve the exact normalization
+                    # math while avoiding a Python float object for every value.
+                    replacements[str(job['path'])] = rows, [array('d', l2norm(v)) for v in values]
+                    index.dim = dimension
+                except IndexCancelled:
+                    raise
+                except Exception as exc:
+                    skipped.append((Path(planned[i]), f'{type(exc).__name__}: {exc}'))
+                    if len(errors) < 5:
+                        errors.append(str(exc))
+                processed += 1
+                progress.advance()
+                if ((self.s.checkpoint_files and len(replacements)-last_saved >= self.s.checkpoint_files)
+                    or (self.s.checkpoint_secs and time.monotonic()-last_checkpoint >= self.s.checkpoint_secs)):
+                    publish()
+                fill()
+            check()
+        except IndexCancelled:
+            cancelled = True
+        except KeyboardInterrupt:
+            cancelled = interrupted = True
         finally:
-            if ex is not None:
-                ex.shutdown(cancel_futures=True)
-            maybe_checkpoint(force=True)
+            stop.set()
+            prep.shutdown(wait=True, cancel_futures=True)
+            net.shutdown(wait=True, cancel_futures=True)
+        # Check the external cancellation again after the final request, before
+        # permitting deletions. stop is now only the internal pool shutdown flag.
+        if bool(cancel() if callable(cancel) else cancel):
+            cancelled = True
+        publish(complete=not cancelled)
+        progress.finish()
+        if interrupted:
+            raise KeyboardInterrupt
+        return result()
 
-        for p in unsupported:
-            skipped.append((p, "API could not embed this input"))
-        return {
-            "files_scanned": len(states),
-            "unchanged": len(unchanged),
-            "planned": len(planned),
-            "indexed_files": len({record['path'] for record in new_records}),
-            "vectors_added": len(new_records),
-            "vectors_total": len(index.records),
-            "dropped": obsolete,
-            "kinds_excluded": kinds_excluded,            "kinds_filter": sorted(allowed) if allowed is not None else None,
-            "rescan": bool(rescan),
-            "cancelled": cancelled,
-            "skipped": skipped,
-            "errors": errors[:5],
-            "seconds": round(time.time() - started, 1),
-        }
-
-    def _media_job(self, path: Path, kind: str, st: dict, root: Path) -> dict:
+    def _media_job(self, path: Path, kind: str, st: dict, root: Path):
         raw = path.read_bytes()
-        if kind == "image":
-            raw = shrink_image(raw, self.s.image_max)
-        item = media_item(raw, mime_of(path, kind), kind)
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) != st['size']:
+            raise ValueError('File changed during preparation')
+        mime = mime_of(path, kind)
+        if kind == 'image':
+            raw, mime = prepare_image(raw, mime, self.s.image_max)
+        item = media_item(raw, mime, kind)
 
-        def record(path=path, st=st, root=root, kind=kind):
-            return {
-                "path": str(path),
-                "rel": _rel(path, root),
-                "kind": kind,
-                "title": path.stem,
-                "snippet": "",
-                "chunk": 0,
-                "chunks": 1,
-                "size": st["size"],
-                "mtime_ns": st["mtime_ns"],
-                "ext": path.suffix.lower(),
-            }
+        def record():
+            return dict(path=str(path), rel=_rel(path, root), kind=kind, title=path.stem, snippet='',
+                        chunk=0, chunks=1, size=st['size'], mtime_ns=st['mtime_ns'], ext=path.suffix.lower(), sha256=digest)
+        return dict(path=path, kind=kind, items=[item], record=record, sha256=digest)
 
-        return {"path": path, "kind": kind, "items": [item], "record": record}
-
-    def _text_job(self, path: Path, kind: str, st: dict, root: Path) -> dict:
+    def _text_job(self, path: Path, kind: str, st: dict, root: Path):
+        digest = _file_hash(path)
         title, text = read_file(path, kind)
         chunks = chunk_text(text, self.s.chunk_chars, self.s.chunk_overlap)
         if not chunks:
-            raise ValueError("no extractable text")
-        chunks = chunks[: self.s.max_chunks]
-        doc_title = (title or "").replace("\n", " ").strip()[:200] or (
-            path.name if kind == "code" else path.stem
-        )
-        items = [self.s.with_prefix_doc(doc_title, c) for c in chunks]
-        records = [
-            {
-                "path": str(path),
-                "rel": _rel(path, root),
-                "kind": kind,
-                "title": title,
-                "snippet": _clean(c)[:400],
-                "chunk": i,
-                "chunks": len(chunks),
-                "size": st["size"],
-                "mtime_ns": st["mtime_ns"],
-                "ext": path.suffix.lower(),
-            }
-            for i, c in enumerate(chunks)
-        ]
-        return {"path": path, "kind": kind, "items": items, "records": records}
+            raise ValueError('no extractable text')
+        if len(chunks) > self.s.max_chunks:
+            raise ValueError(f'Document exceeds {self.s.max_chunks} text chunks; split it into smaller files. Previous vectors retained.')
+        doc_title = (title or '').replace('\n', ' ').strip()[:200] or (path.name if kind == 'code' else path.stem)
+        records = [dict(path=str(path), rel=_rel(path, root), kind=kind, title=title, snippet=_clean(c)[:400],
+                        chunk=i, chunks=len(chunks), size=st['size'], mtime_ns=st['mtime_ns'],
+                        ext=path.suffix.lower(), sha256=digest) for i, c in enumerate(chunks)]
+        return dict(path=path, kind=kind, items=[self.s.with_prefix_doc(doc_title, c) for c in chunks], records=records, sha256=digest)
+
+
+def _same_file(path, state):
+    stat = path.stat()
+    if stat.st_size != state['size'] or stat.st_mtime_ns != state['mtime_ns']:
+        raise ValueError('File changed during indexing; previous vectors retained')
+
+
+def _file_hash(path, check=lambda: None):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        while True:
+            check()
+            block = source.read(131072)
+            if not block:
+                return digest.hexdigest()
+            digest.update(block)
+
+
+def _valid_vector(vector, dimension):
+    return (len(vector) == dimension and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in vector)
+            and math.isfinite(math.hypot(*vector)) and math.hypot(*vector) > 1e-12)
 
 
 class _Progress:
-    def __init__(self, log, total_items: int, total_files: int):
-        import sys
-
-        self.log = log
-        self.total_items = total_items
-        self.total_files = total_files
+    def __init__(self, log, total_files):
+        self.log, self.total = log, total_files
         self.completed = 0
-        self.files_done = 0
-        self.started = time.time()
-        self.last_shown = 0.0
-        self.tty = bool(log) and sys.stdout.isatty()
+        self.started = time.monotonic()
+        self.last_shown = 0.
 
-    def mark_done(self, idx: int, done: list, item_job: list, remaining: list):
-        if done[idx]:
-            return
-        done[idx] = True
+    def advance(self):
         self.completed += 1
-        ji = item_job[idx]
-        remaining[ji] -= 1
-        if remaining[ji] == 0:
-            self.files_done += 1
+        self.show()
 
     def show(self, force=False):
-        if not self.log or not self.total_items:
-            return
-        now = time.time()
-        gap = 0.2 if self.tty else 2.0
-        if not force and now - self.last_shown < gap:
+        now = time.monotonic()
+        if not self.log or not self.total or (not force and now-self.last_shown < 2):
             return
         self.last_shown = now
-        msg = self.message(now)
-        if self.tty:
-            import sys
-
-            sys.stdout.write("\r" + msg + " " * 6)
-            sys.stdout.flush()
-        else:
-            self.log(msg)
-
-    def message(self, now=None) -> str:
-        now = now if now is not None else time.time()
-        elapsed = max(now - self.started, 1e-6)
-        rate = self.completed / elapsed
-        pct = 100.0 * self.completed / self.total_items if self.total_items else 100.0
-        eta = (self.total_items - self.completed) / rate if rate > 0 else None
-        return (
-            f"  embedding {self.completed}/{self.total_items} items ({pct:.0f}%), "
-            f"{self.files_done}/{self.total_files} files "
-            f"· {rate:.1f} items/s · ETA {_fmt_eta(eta)}"
-        )
+        elapsed = max(now-self.started, 1e-6)
+        rate = self.completed/elapsed
+        eta = _fmt_eta((self.total-self.completed)/rate if rate else None)
+        self.log(f'indexing {self.completed}/{self.total} files ({100*self.completed/self.total:.0f}%) · {rate:.1f} files/s · ETA {eta}')
 
     def finish(self):
-        if not self.log or not self.total_items:
-            return
-        self.show(force=True)
-        if self.tty:
-            import sys
-
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        self.show(True)
 
 
-def _fmt_eta(seconds) -> str:
+def _fmt_eta(seconds):
     if seconds is None:
-        return "--:--"
-    seconds = int(seconds)
-    if seconds < 0:
-        seconds = 0
-    if seconds < 3600:
-        return f"{seconds // 60}:{seconds % 60:02d}"
-    return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+        return '--:--'
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    return f'{minutes}:{seconds:02}'
 
 
-def _root_of(path: Path, roots: list[Path]) -> Path:
-    best = None
-    for root in roots:
-        try:
-            path.relative_to(root)
-        except ValueError:
-            continue
-        if best is None or len(str(root)) > len(str(best)):
-            best = root
-    return best or path.parent
+def _root_of(path, roots):
+    return max((r for r in roots if path.is_relative_to(r)), key=lambda r: len(str(r)), default=path.parent)
 
 
-def _clean(text: str) -> str:
-    return " ".join(text.split())
+def _clean(text):
+    return ' '.join(text.split())
 
 
-def _rel(path: Path, root: Path) -> str:
+def _rel(path, root):
     try:
         return str(path.relative_to(root))
     except ValueError:
         return path.name
 
 
-def _under_any(path: str, roots: list[Path]) -> bool:
-    p = Path(path)
-    for r in roots:
-        try:
-            p.relative_to(r)
-            return True
-        except ValueError:
-            continue
-    return False
+def _under_any(path, roots):
+    return any(Path(path).is_relative_to(root) for root in roots)

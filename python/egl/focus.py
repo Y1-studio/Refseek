@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .api import l2norm
+from .dimensions import prefix_vector
 from .search import Searcher
 from .store import _np
 
@@ -102,12 +103,13 @@ class FocusEngine:
             return {'available':False,'verified':False,'default_method':'baseline',
                     'research_available':not getattr(self.s,'bundled_q8',False),'error':str(exc)}
 
-    def calibrate(self, focus="style"):
+    def calibrate(self, focus="style", dimension=None):
         if focus not in FOCUS_GROUPS:
             raise ValueError("unknown focus aspect")
+        cache_key = focus if dimension is None else (focus, dimension)
         with self.lock:
-            if focus in self.bases:
-                return self.bases[focus]
+            if cache_key in self.bases:
+                return self.bases[cache_key]
             group = FOCUS_GROUPS[focus]
             contexts, levels = group["contexts"], group["levels"]
             texts = [group["template"].format(level=level, context=context)
@@ -117,6 +119,11 @@ class FocusEngine:
             dim = len(vectors[0])
             if any(len(v) != dim or not all(math.isfinite(x) for x in v) for v in vectors):
                 raise ValueError("model returned invalid calibration embeddings")
+            if dimension is not None:
+                if dim < dimension:
+                    raise ValueError('model output is smaller than the selected search dimensions')
+                vectors = [prefix_vector(v, dimension) for v in vectors]
+                dim = dimension
             means = [[sum(vectors[i * len(contexts) + j][d]
                           for j in range(len(contexts))) / len(contexts)
                       for d in range(dim)] for i in range(len(levels))]
@@ -133,11 +140,11 @@ class FocusEngine:
                     basis.append(l2norm(residual))
             if not basis:
                 raise ValueError(f"the model did not produce distinguishable {focus} directions")
-            self.bases[focus] = basis
+            self.bases[cache_key] = basis
             return basis
 
-    def channels(self, vector, focus="style"):
-        basis = self.bases[focus]
+    def channels(self, vector, focus="style", dimension=None):
+        basis = self.bases[focus if dimension is None else (focus, dimension)]
         vector = l2norm(vector)
         coords = [dot(vector, axis) for axis in basis]
         residual = [x - sum(c * axis[d] for c, axis in zip(coords, basis))
@@ -168,27 +175,28 @@ class FocusEngine:
                 self.images.popitem(last=False)
         return vector
 
-    def candidates(self, index, focus="style"):
+    def candidates(self, index, focus="style", dimension=None):
+        cache_key = focus if dimension is None else (focus, dimension)
         # Reload only when the web server has loaded a new Index object.
         with self.lock:
             self.library_cache = {key: value for key, value in self.library_cache.items()
                                   if value[0] is index}
-            cached = self.library_cache.get(focus)
+            cached = self.library_cache.get(cache_key)
             if cached is not None and cached[0] is index:
                 return cached[1]
         if focus != "style":
             # Share original and subject matrices instead of retaining one copy
             # of the entire library for each additional aspect.
-            base = self.candidates(index)
+            base = self.candidates(index, dimension=dimension)
             if base["numpy"]:
-                coords = base["vectors"] @ _np.asarray(self.bases[focus], dtype=_np.float64).T
+                coords = base["vectors"] @ _np.asarray(self.bases[cache_key], dtype=_np.float64).T
                 coords /= _np.maximum(_np.linalg.norm(coords, axis=1, keepdims=True), 1e-12)
             else:
-                coords = [l2norm([dot(v, axis) for axis in self.bases[focus]])
+                coords = [l2norm([dot(v, axis) for axis in self.bases[cache_key]])
                           for v in base["vectors"]]
             rows = dict(base, styles=coords)
             with self.lock:
-                self.library_cache[focus] = (index, rows)
+                self.library_cache[cache_key] = (index, rows)
             return rows
         records, vectors = [], []
         seen = set()
@@ -198,11 +206,11 @@ class FocusEngine:
                 continue
             seen.add(path)
             records.append(record)
-            vectors.append(vector)
+            vectors.append(prefix_vector(vector, dimension) if dimension is not None else vector)
         if _np is not None and vectors:
             matrix = _np.asarray(vectors, dtype=_np.float64)
             matrix /= _np.maximum(_np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
-            axes = _np.asarray(self.bases[focus], dtype=_np.float64)
+            axes = _np.asarray(self.bases[cache_key], dtype=_np.float64)
             styles = matrix @ axes.T
             subjects = matrix - styles @ axes
             subjects /= _np.maximum(_np.linalg.norm(subjects, axis=1, keepdims=True), 1e-12)
@@ -210,13 +218,13 @@ class FocusEngine:
             rows = {"records": records, "vectors": matrix,
                     "subjects": subjects, "styles": styles, "numpy": True}
         else:
-            channels = [self.channels(v, focus) for v in vectors]
+            channels = [self.channels(v, focus, dimension) for v in vectors]
             rows = {"records": records, "vectors": [l2norm(v) for v in vectors],
                     "subjects": [c[0] for c in channels],
                     "styles": [c[1] for c in channels], "numpy": False}
         with self.lock:
             # Only the current index is retained for each aspect.
-            self.library_cache[focus] = (index, rows)
+            self.library_cache[cache_key] = (index, rows)
         return rows
 
     def search(self, payload, index):
@@ -288,7 +296,7 @@ class FocusEngine:
                          + ("Pose matches broad body configurations, not exact joint positions."
                             if focus == "pose" else "Subject focus reduces style differences."))}
 
-    def search_gallery(self, payload, index, *, roots=None, k=24, offset=0):
+    def search_gallery(self, payload, index, *, roots=None, scope=None, k=24, offset=0):
         """Main GUI aspect search, including text blending, negatives and paging.
 
         The aspect score is the same one used in the comparison demo. Text and
@@ -323,8 +331,7 @@ class FocusEngine:
         niw = weight("neg_image_weight", 1, 2)
         path = payload.get("path")
         if path:
-            vector = next((v for r, v in zip(index.records, index.vectors)
-                           if r.get("path") == path and r.get("kind") == "image"), None)
+            vector = index.image_vector_at(path)
             if vector is None:
                 raise ValueError("reference image is no longer in this index")
         else:
@@ -348,31 +355,50 @@ class FocusEngine:
 
         if len(q) != index.dim or not all(math.isfinite(x) for x in q):
             raise ValueError("query and library dimensions differ; use the matching model/index")
+        reduced_dim = index.search_dim
+        scoring_dim = reduced_dim or index.dim
+
+        def reduce(vector):
+            return prefix_vector(vector, reduced_dim) if reduced_dim else vector
+
+        scoring_query = reduce(q)
         wants = text_list(payload.get("q", "")) + text_list(payload.get("wants", []))
         if not wants:
             alpha = 1.0
-        text_vectors = embed_texts(wants) if wants and alpha < 1 else []
+        text_vectors = [reduce(v) for v in embed_texts(wants)] if wants and alpha < 1 else []
         text_mean = (l2norm([sum(v[d] for v in text_vectors) / len(text_vectors)
-                            for d in range(index.dim)]) if text_vectors else None)
+                            for d in range(scoring_dim)]) if text_vectors else None)
         excludes = text_list(payload.get("not", []))
-        negatives = embed_texts(excludes) if excludes and nw else []
+        negatives = [reduce(v) for v in embed_texts(excludes)] if excludes and nw else []
         negative_mean = ([sum(v[d] for v in negatives) / len(negatives)
-                          for d in range(index.dim)] if negatives else None)
-        neg_image = self.image_vector(payload["neg_image"]) if payload.get("neg_image") and niw else None
+                          for d in range(scoring_dim)] if negatives else None)
+        neg_image = None
+        if payload.get("neg_image") and niw:
+            neg = payload["neg_image"]
+            if isinstance(neg, dict) and neg.get("path"):
+                neg_image = index.image_vector_at(neg["path"])
+                if neg_image is None:
+                    raise ValueError("negative image is no longer in this index")
+                neg_image = l2norm(neg_image)
+            else:
+                neg_image = self.image_vector(neg)
         if neg_image is not None and len(neg_image) != index.dim:
             raise ValueError("ignore-image and library dimensions differ")
+        if neg_image is not None:
+            neg_image = reduce(neg_image)
 
         # A zero-strength focus needs no calibration, including on a cold server.
         basis_focus = "style" if focus == "subject" else focus
         focused = focus != "original" and not native_style and strength > 0 and alpha > 0
         energy = 1.0
+        basis_dimension = reduced_dim if method == 'baseline' else None
         if focused and not trained_style:
-            self.calibrate("style")
-            basis = self.calibrate(basis_focus)
-            if len(basis[0]) != index.dim:
+            self.calibrate("style", basis_dimension)
+            basis = self.calibrate(basis_focus, basis_dimension)
+            if len(basis[0]) != (basis_dimension or index.dim):
                 raise ValueError("calibration and library dimensions differ")
-            rows = self.candidates(index, basis_focus)
-            residual, coords, energy = self.channels(q, basis_focus)
+            rows = self.candidates(index, basis_focus, basis_dimension)
+            residual, coords, energy = self.channels(scoring_query if basis_dimension else q, basis_focus, basis_dimension)
             if focus == "subject":
                 energy = max(0.0, 1.0 - energy)
             channel_query = residual if focus == "subject" else coords
@@ -395,13 +421,24 @@ class FocusEngine:
                     self.library_cache = {key: value for key, value in self.library_cache.items() if value[0] is index}
                     self.library_cache["_original"] = (index, rows)
 
+        scoring_rows = rows['vectors']
+        if reduced_dim and not (focused and not trained_style and basis_dimension):
+            if 'reduced_vectors' not in rows:
+                if rows['numpy']:
+                    matrix = rows['vectors'][:, :reduced_dim].copy()
+                    matrix /= _np.maximum(_np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+                else:
+                    matrix = [reduce(v) for v in rows['vectors']]
+                rows['reduced_vectors'] = matrix
+            scoring_rows = rows['reduced_vectors']
+
         def scores(v, matrix=None):
-            matrix = rows["vectors"] if matrix is None else matrix
+            matrix = scoring_rows if matrix is None else matrix
             if rows["numpy"]:
                 return matrix @ _np.asarray(v)
             return [dot(v, row) for row in matrix]
 
-        original_scores = scores(q)
+        original_scores = scores(scoring_query)
         aspect_scores = scores(channel_query, channel_vectors) if focused and not trained_style else original_scores
         method_note = ""
         method_applied = "baseline"
@@ -427,7 +464,7 @@ class FocusEngine:
         negative_scores = scores(negative_mean) if negative_mean else None
         negative_image_scores = scores(neg_image) if neg_image is not None else None
         fused_norm = (sum((alpha * a + (1 - alpha) * b) ** 2
-                          for a, b in zip(q, text_mean)) ** 0.5 if text_mean else 1.0) or 1.0
+                          for a, b in zip(scoring_query, text_mean)) ** 0.5 if text_mean else 1.0) or 1.0
         kindset = set(payload.get("kind") or [])
         hits = []
         for i, r in enumerate(rows["records"]):
@@ -437,6 +474,8 @@ class FocusEngine:
             if kindset and "image" not in kindset:
                 continue
             if roots and not any(Path(candidate_path).is_relative_to(Path(root)) for root in roots):
+                continue
+            if scope is not None and not scope.allows(candidate_path):
                 continue
             original = float(original_scores[i])
             ordinary = (alpha * original + (1 - alpha) * float(text_scores[i])) / fused_norm if text_scores is not None else original

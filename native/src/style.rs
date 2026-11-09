@@ -197,11 +197,11 @@ impl Metric {
     pub fn project(&self, x: &[f64]) -> Vec<f64> {
         self.project_batch(&[x.to_vec()]).remove(0)
     }
-    pub fn project_batch(&self, x: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    pub fn project_batch(&self, x: &[impl AsRef<[f64]>]) -> Vec<Vec<f64>> {
         if x.is_empty() {
             return vec![];
         }
-        let mut a = x.iter().flat_map(|v| unit(v)).collect::<Vec<_>>();
+        let mut a = x.iter().flat_map(|v| unit(v.as_ref())).collect::<Vec<_>>();
         if let Some((mean, w)) = &self.warm {
             for row in a.chunks_mut(768) {
                 for (i, v) in row.iter_mut().enumerate() {

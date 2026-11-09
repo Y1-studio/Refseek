@@ -22,6 +22,7 @@ pub struct Runtime {
     pub backend: String,
     pub device: String,
     pub probes: serde_json::Value,
+    pub attempts: Vec<serde_json::Value>,
     child: Child,
     _job: platform::OwnedJob,
 }
@@ -120,7 +121,7 @@ pub fn assets(
     fs::rename(&staging, &dest).map_err(err)?;
     Ok(dest.join("assets"))
 }
-fn output(exe: &Path, args: &[&str]) -> Res<String> {
+fn output(exe: &Path, args: &[&str], cancel: &AtomicBool, progress: &dyn Fn(String)) -> Res<String> {
     let mut c = Command::new(exe);
     platform::hidden(&mut c);
     let mut child = c
@@ -154,24 +155,36 @@ fn output(exe: &Path, args: &[&str]) -> Res<String> {
             .read_to_string(&mut s);
         s
     });
-    let end = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let end = started + Duration::from_secs(120);
+    let mut tick = Instant::now();
+    let mut failure = None;
     loop {
-        if child.try_wait().map_err(err)?.is_some() {
+        if let Some(status) = child.try_wait().map_err(err)? {
+            if !status.success() { failure = Some(format!("Device detection exited with {status}")); }
             break;
         }
-        if Instant::now() > end {
+        if cancel.load(Ordering::Relaxed) || Instant::now() > end {
+            failure = Some(if cancel.load(Ordering::Relaxed) {"Startup cancelled".into()}
+                else {"Device detection timed out after 120 seconds".into()});
             let _ = child.kill();
             let _ = child.wait();
             break;
         }
+        if tick.elapsed().as_secs() >= 5 {
+            progress(format!("Waiting for graphics device detection · {}s (first launch can take longer)", started.elapsed().as_secs()));
+            tick = Instant::now();
+        }
         thread::sleep(Duration::from_millis(100));
     }
     drop(job);
-    Ok(format!(
+    let raw = format!(
         "{}\n{}",
         a.join().unwrap_or_default(),
         b.join().unwrap_or_default()
-    ))
+    );
+    if let Some(error) = failure { return Err(format!("{error}\n{}", raw.chars().rev().take(800).collect::<String>().chars().rev().collect::<String>())); }
+    Ok(raw)
 }
 impl Runtime {
     pub fn start(
@@ -198,25 +211,35 @@ impl Runtime {
                 return Err(format!("Model SHA256 mismatch: {name}"));
             }
         }
-        let mut candidates = vec![];
-        for kind in ["cuda", "vulkan"] {
+        let mut errors = vec![];
+        let mut attempts = vec![];
+        for kind in ["cuda", "vulkan", "cpu"] {
             if backend != "auto" && backend != kind {
                 continue;
             }
             if cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled".into());
             }
-            progress(format!("Verifying and detecting {kind} devices…"));
+            let mut candidates = vec![];
+            progress(format!("Verifying {}{}…", kind, if kind == "cpu" {" runtime"} else {" and detecting devices"}));
             if let Err(e) = verify_backend(assets, kind) {
                 progress(format!("{kind} unavailable: {e}"));
                 let _ = atomic(&data.join(format!("logs/devices-{kind}.txt")), e.as_bytes());
+                attempts.push(serde_json::json!({"stage":"integrity","backend":kind,"error":e}));
+                save_json(&data.join("backend-attempts.json"), &attempts)?;
                 continue;
             }
+            if kind == "cpu" {
+                candidates.push(("cpu".into(), "none".into(), "CPU".into()));
+            } else {
             let exe = assets.join(format!("runtimes/{kind}/llama-server.exe"));
-            let raw = match output(&exe, &["--list-devices"]) {
+            let raw = match output(&exe, &["--list-devices"], &cancel, progress) {
                 Ok(s) => s,
                 Err(e) => {
                     progress(format!("{kind} detection unavailable: {e}"));
+                    let _ = atomic(&data.join(format!("logs/devices-{kind}.txt")), e.as_bytes());
+                    attempts.push(serde_json::json!({"stage":"detection","backend":kind,"error":e}));
+                    save_json(&data.join("backend-attempts.json"), &attempts)?;
                     continue;
                 }
             };
@@ -248,17 +271,12 @@ impl Runtime {
                     }
                 }
             }
-        }
-        if backend == "auto" || backend == "cpu" {
-            verify_backend(assets, "cpu")?;
-            candidates.push(("cpu".into(), "none".into(), "CPU".into()));
-        }
+            }
         if candidates.is_empty() {
-            return Err(format!(
-                "No usable {backend} device was detected. Choose Auto or CPU."
-            ));
+            attempts.push(serde_json::json!({"stage":"detection","backend":kind,"error":"No matching hardware device detected"}));
+            save_json(&data.join("backend-attempts.json"), &attempts)?;
+            continue;
         }
-        let mut errors = vec![];
         for (kind, id, label) in candidates {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Cancelled".into());
@@ -307,7 +325,7 @@ impl Runtime {
                 if kind == "cpu" {
                     c.arg("--no-mmproj-offload");
                 } else {
-                    c.args(["--mmproj-device", &id]);
+                    c.args(["--mmproj-offload", "--op-offload", "--kv-offload", "--mmproj-device", &id]);
                 }
                 let f = File::create(&log).map_err(err)?;
                 c.stdout(f.try_clone().map_err(err)?).stderr(f);
@@ -325,10 +343,13 @@ impl Runtime {
                     backend: kind.clone(),
                     device: label.clone(),
                     probes: serde_json::Value::Null,
+                    attempts: vec![],
                     child,
                     _job: job,
                 };
-                let end = Instant::now() + Duration::from_secs(180);
+                let started = Instant::now();
+                let end = started + Duration::from_secs(if kind == "cpu" {180} else {600});
+                let mut tick = Instant::now();
                 loop {
                     if cancel.load(Ordering::Relaxed) {
                         return Err("Cancelled".into());
@@ -342,6 +363,10 @@ impl Runtime {
                     if Instant::now() > end {
                         return Err(format!("Model startup timed out; see {}", log.display()));
                     }
+                    if tick.elapsed().as_secs() >= 5 {
+                        progress(format!("Loading {kind} · {}s · waiting for model and GPU initialization", started.elapsed().as_secs()));
+                        tick = Instant::now();
+                    }
                     thread::sleep(Duration::from_millis(300));
                 }
                 progress(format!(
@@ -353,19 +378,19 @@ impl Runtime {
                 if hash(&img) != p["image_sha256"].as_str().unwrap_or("") {
                     return Err("Image probe hash mismatch".into());
                 }
-                let text = runtime.api.embed(vec![p["text"].clone()])?.remove(0);
+                let text = runtime.api.embed_cancellable(vec![p["text"].clone()],&cancel)?.remove(0);
                 let image = runtime
                     .api
-                    .embed(vec![media(
+                    .embed_cancellable(vec![media(
                         p["mime"].as_str().unwrap_or("image/jpeg"),
                         &img,
-                    )])?
+                    )],&cancel)?
                     .remove(0);
                 let t = npy(&fs::read(base.join("probe-text.npy")).map_err(err)?)?;
                 let i = npy(&fs::read(base.join("probe-image.npy")).map_err(err)?)?;
                 let tc = dot(&text, &unit(&t.values));
                 let ic = dot(&image, &unit(&i.values));
-                if tc < 0.9995 || ic < 0.9995 {
+                if !tc.is_finite() || !ic.is_finite() || tc < 0.9995 || ic < 0.9995 {
                     return Err(format!(
                         "Style compatibility failed: text {tc:.7}, image {ic:.7}"
                     ));
@@ -374,13 +399,23 @@ impl Runtime {
                 Ok(runtime)
             })();
             match result {
-                Ok(r) => return Ok(r),
+                Ok(mut r) => {
+                    attempts.push(serde_json::json!({"stage":"ready","backend":kind,"device":id,"log":log,"pid":r.child.id(),
+                        "model_gpu_layers":if kind == "cpu" {"0"} else {"all"},"vision_gpu_offload":kind != "cpu"}));
+                    save_json(&data.join("backend-attempts.json"), &attempts)?;
+                    r.attempts = attempts;
+                    return Ok(r);
+                },
                 Err(e) => {
                     progress(format!("{kind} failed; trying the next backend…"));
                     errors.push(format!("{kind}/{id}: {e}"));
+                    attempts.push(serde_json::json!({"stage":"inference","backend":kind,"device":id,"error":e,"log":log}));
+                    save_json(&data.join("backend-attempts.json"), &attempts)?;
                 }
             }
         }
-        Err(errors.join("\n"))
+        }
+        if cancel.load(Ordering::Relaxed) {return Err("Startup cancelled".into());}
+        Err(format!("No usable {backend} backend passed startup. {} See backend-attempts.json and logs.", errors.join("\n")))
     }
 }

@@ -16,7 +16,7 @@ Run the commands below from `native/`.
 
 ## Recover resources
 
-Download the matching [desktop EXE](https://github.com/Y1-studio/Refseek/releases/tag/v2.0.1), then recover its resources:
+Download the matching [desktop EXE](https://github.com/Y1-studio/Refseek/releases/tag/v2.2.0), then recover its resources:
 
 ```powershell
 python tooling/prepare-assets.py --from-exe "C:\Downloads\Refseek-Desktop.exe"
@@ -86,3 +86,22 @@ The checks cover adapter arithmetic, image transport, indexing, drag/drop, searc
 Small WebP files, including WebP bytes named `.jpg`, are decoded locally and sent as full-frame lossless PNG. The pinned server can't decode direct WebP without ffmpeg. Existing small JPEG/PNG transport stays unchanged; these image searches don't need an ffmpeg installation.
 
 These checks measure engineering compatibility, not retrieval accuracy. Preserve model pins, trained weights, saved blends and probes when making unrelated changes.
+
+## Dimension and subfolder checks
+
+Run these with a separate diagnostic home:
+
+```powershell
+.\Refseek-Desktop.exe --dimension-check --home ".\verification\dimensions"
+.\Refseek-Desktop.exe --gui-smoke --feature-gui-check --home ".\verification\folder-controls"
+```
+
+The first command checks old 768-dimensional libraries, all supported dimensions, unchanged-file reuse, hierarchical folder filters, and trained-style score parity. The second exercises the new controls in the native window and saves screenshots.
+
+For timing, prepare a folder containing at least 12 distinct, readable full images directly in that folder. The benchmark runs the same files at all four dimensions in three different orders. Each run starts with an empty index and requires every image to be newly embedded:
+
+```powershell
+.\Refseek-Desktop.exe --benchmark-dimensions --benchmark-images "C:\BenchmarkPictures" --home ".\verification\dimension-speed" --backend cuda --device CUDA0
+```
+
+The JSON report separates embedding/preparation time from snapshot time and records primary-vector and full-style-cache sizes. Timings exclude model startup. The model still produces 768 values; smaller primary vectors are truncated and normalized afterward. This measures indexing speed, not retrieval quality. Avoid other indexing or build jobs during the timing run.

@@ -118,6 +118,26 @@ def mime_of(path: Path, kind: str) -> str:
     return MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
 
 
+def prepare_image(raw, mime, max_side):
+    """Use lossless PNG transport for WebP, including mislabeled files."""
+    if raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+        from io import BytesIO
+        from PIL import Image
+
+        with Image.open(BytesIO(raw)) as image:
+            if max_side > 0:
+                image.thumbnail((max_side, max_side), Image.LANCZOS)
+            output = BytesIO()
+            image.convert('RGBA' if 'A' in image.getbands() else 'RGB').save(output, 'PNG')
+        return output.getvalue(), 'image/png'
+    prepared = shrink_image(raw, max_side)
+    if prepared.startswith(b'\x89PNG\r\n\x1a\n'):
+        mime = 'image/png'
+    elif prepared.startswith(b'\xff\xd8\xff'):
+        mime = 'image/jpeg'
+    return prepared, mime
+
+
 _MAX_TEXT_BYTES = 20_000_000
 
 

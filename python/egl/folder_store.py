@@ -19,10 +19,10 @@ def digest(raw):return hashlib.sha256(raw).hexdigest()
 
 
 @contextmanager
-def library_lock(root):
+def library_lock(root, name='.library.lock'):
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     # OS locks release on process death; a leftover lock file is harmless.
-    with (root/'.library.lock').open('a+b') as stream:
+    with (root/name).open('a+b') as stream:
         stream.seek(0,2)
         if stream.tell()==0:stream.write(b'0');stream.flush()
         deadline=time.monotonic()+30
@@ -50,9 +50,9 @@ def library_lock(root):
                 fcntl.flock(stream.fileno(),fcntl.LOCK_UN)
 
 
-def read_catalog(root):
+def read_catalog(root, name='catalog.json'):
     from .store import CorruptIndexError, _read_retry
-    path=Path(root)/'catalog.json'
+    path=Path(root)/name
     try:
         raw=_read_retry(path);catalog=json.loads(raw.decode('utf-8'))
         if catalog.get('format')!='folder-index-v1' or not isinstance(catalog.get('folders'),list):
@@ -89,17 +89,38 @@ def selected(entry,roots):
     return any(Path(root).is_relative_to(Path(r)) or Path(r).is_relative_to(Path(root)) for r in roots)
 
 
+def read_folder_tree(root):
+    from .folder_scope import folder_tree
+    from .store import CorruptIndexError, _read_retry
+
+    paths = set()
+    with library_lock(root):
+        catalog, _ = read_catalog(root)
+        for entry in catalog['folders']:
+            raw = _read_retry(snapshot_path(root, entry['snapshot']) / 'index.json')
+            if digest(raw) != entry['index_sha256']:
+                raise CorruptIndexError('Folder metadata checksum mismatch.')
+            try:
+                paths.update(row['path'] for row in json.loads(raw)['records'])
+            except (ValueError, TypeError, KeyError) as error:
+                raise CorruptIndexError('Invalid folder metadata.') from error
+    return folder_tree(catalog['roots'], ({'path': path} for path in paths))
+
+
 def load(index,roots=None):
     from .store import CorruptIndexError, _read_retry
+    from .dimensions import DIMENSIONS
     with library_lock(index.data_dir):
         catalog,raw=read_catalog(index.data_dir)
-        for attr,key in [('dim','dim'),('model','model'),('api_type','api_type'),('roots','roots'),
+        for attr,key in [('dim','dim'),('search_dim','search_dim'),('model','model'),('api_type','api_type'),('roots','roots'),
                          ('kind_filter','kinds_filter'),('created','created'),('updated','updated')]:
             setattr(index,attr,catalog.get(key))
         index.roots=index.roots or []
+        if index.search_dim is not None and (index.search_dim not in DIMENSIONS or not index.dim or index.search_dim >= index.dim):
+            raise CorruptIndexError('Invalid saved search dimensions')
         index._catalog_digest=digest(raw);index._catalog=catalog
         index._partial=bool(roots);index._folder_entries=catalog['folders']
-        records=[];vectors=[];positions=[];all_positions=[];ids=set()
+        records=[];vectors=[];reduced=[];positions=[];all_positions=[];ids=set()
         for entry in catalog['folders']:
             order=entry['positions'];all_positions.extend(order)
             if entry['id'] in ids or len(order)!=entry['count']:raise CorruptIndexError('Invalid folder catalog counts or repeated IDs')
@@ -116,6 +137,14 @@ def load(index,roots=None):
                     raise CorruptIndexError('index/vector counts or model dimensions differ')
                 values=array('f');values.frombytes(vec_raw)
                 if sys.byteorder=='big':values.byteswap()
+                if index.search_dim:
+                    size = index.search_dim
+                    raw_search = _read_retry(folder/'search-vectors.f32')
+                    if len(raw_search) != len(rows)*size*4 or digest(raw_search) != entry.get('search_sha256'):
+                        raise CorruptIndexError('reduced search vectors failed verification')
+                    values_search = array('f'); values_search.frombytes(raw_search)
+                    if sys.byteorder == 'big': values_search.byteswap()
+                    reduced.extend(values_search[i*size:(i+1)*size] for i in range(len(rows)))
                 if any(not isinstance(p,int) or isinstance(p,bool) for p in order):
                     raise CorruptIndexError('invalid record ordering')
                 records.extend(rows);vectors.extend(values[i*dim:(i+1)*dim] for i in range(len(rows)));positions.extend(order)
@@ -126,6 +155,8 @@ def load(index,roots=None):
             raise CorruptIndexError('Folder catalog ordering is incomplete or repeated')
         order=sorted(range(len(records)),key=positions.__getitem__)
         index.records=[records[i] for i in order];index.vectors=[vectors[i] for i in order]
+        if index.search_dim:
+            index._reduced_vectors = [reduced[i] for i in order]
     return index
 
 
@@ -143,10 +174,14 @@ def folder_id(root):
 
 def save(index):
     from .store import CorruptIndexError, _atomic_write
+    from .dimensions import DIMENSIONS, prefix_vector
     if getattr(index,'_partial',False):raise ValueError('A folder-filtered search view cannot be saved')
     if index._problem:raise CorruptIndexError('Refusing to migrate/save an incomplete index: '+index._problem)
     if len(index.records)!=len(index.vectors):raise CorruptIndexError('Record/vector counts differ before saving')
     dim=index.dim or 0
+    search_dim = index.search_dim if dim and index.search_dim != dim else None
+    if search_dim is not None and (search_dim not in DIMENSIONS or search_dim >= dim):
+        raise CorruptIndexError('Selected search dimensions exceed the model output')
     if any(len(v)!=dim for v in index.vectors) or (index.records and not dim):
         raise CorruptIndexError('Invalid vector dimensions before saving')
     root=index.data_dir;root.mkdir(parents=True,exist_ok=True)
@@ -176,10 +211,12 @@ def save(index):
         for folder,positions in groups.items():
             rows=[index.records[i] for i in positions]
             values=array('f')
-            for i in positions:values.extend(index.vectors[i])
+            for i in positions:values.extend(iter(index.vectors[i]))
             if sys.byteorder=='big':values.byteswap()
             vec_raw=values.tobytes();vec_hash=digest(vec_raw)
             content=dict(version=1,root=folder,roots=[folder] if folder else [],model=index.model,api_type=index.api_type,dim=index.dim,records=rows,count=len(rows))
+            if search_dim:
+                content['search_dim'] = search_dim
             fingerprint=digest(encoded(content)+vec_hash.encode())
             old=previous.get(folder)
             if old and old['fingerprint']==fingerprint:
@@ -189,6 +226,12 @@ def save(index):
                 destination=snapshot_path(root,snapshot);destination.mkdir(parents=True,exist_ok=True)
                 meta=dict(content,created=old.get('created') if old else index.created,updated=index.updated)
                 meta_raw=encoded(meta)
+                search_raw = None
+                if search_dim:
+                    search_values = array('f')
+                    for i in positions: search_values.extend(prefix_vector(index.vectors[i], search_dim))
+                    if sys.byteorder == 'big': search_values.byteswap()
+                    search_raw = search_values.tobytes()
                 # A previously committed snapshot is immutable, even when content
                 # returns to an earlier state after a remove/re-add cycle.
                 if (destination/'index.json').exists() and (destination/'vectors.f32').exists():
@@ -199,46 +242,122 @@ def save(index):
                     meta_raw=existing
                 else:
                     _atomic_write(destination/'vectors.f32',vec_raw)
+                    if search_raw is not None:
+                        _atomic_write(destination/'search-vectors.f32',search_raw)
                     _atomic_write(destination/'index.json',meta_raw)
                 if digest((destination/'vectors.f32').read_bytes())!=vec_hash or digest((destination/'index.json').read_bytes())!=digest(meta_raw):
                     raise CorruptIndexError('Folder snapshot failed verification after save')
                 entry=dict(id=ident,root=folder,snapshot=snapshot,count=len(rows),files=len({r['path'] for r in rows}),
                            positions=positions,index_sha256=digest(meta_raw),vectors_sha256=vec_hash,
                            fingerprint=fingerprint,created=meta.get('created'),updated=meta.get('updated'),size_bytes=len(vec_raw))
+                if search_raw is not None:
+                    entry.update(search_sha256=digest(search_raw), search_size_bytes=len(search_raw))
+                    if digest((destination/'search-vectors.f32').read_bytes()) != entry['search_sha256']:
+                        raise CorruptIndexError('Reduced vectors failed verification after save')
                 written+=1
             entries.append(entry)
         catalog=dict(format='folder-index-v1',version=2,model=index.model,api_type=index.api_type,dim=index.dim,
                      roots=index.roots,kinds_filter=index.kind_filter,created=index.created,updated=index.updated,
                      count=len(index.records),folders=entries)
+        if search_dim:
+            catalog['search_dim'] = search_dim
+        index.search_dim = search_dim
+        index._reduced_vectors = index._reduced_matrix = None
+        index.__dict__.pop('_folder_tree', None)
+        if old_raw is not None and all(current.get(k) == value for k, value in catalog.items() if k != 'updated'):
+            index.updated = current.get('updated')
+            index.last_save = dict(folders_written=0, folders_unchanged=len(entries))
+            return
         raw=encoded(catalog)
-        if old_raw is not None:_atomic_write(root/'catalog.json.bak',old_raw)
+        # Publish first: a failed active replace must never rotate recovery.
         _atomic_write(root/'catalog.json',raw)
+        recovery_warning = None
+        if old_raw is not None:
+            try:
+                _atomic_write(root/'catalog.json.bak',old_raw)
+            except OSError as exc:
+                recovery_warning = 'Index saved, but recovery could not be updated; older snapshots retained: ' + str(exc)
         index._catalog_digest=digest(raw);index._catalog=catalog;index._folder_entries=entries
-        index._matrix=None;index.last_save=dict(folders_written=written,folders_unchanged=len(entries)-written)
+        index._matrix=None;index.last_save=dict(folders_written=written,folders_unchanged=len(entries)-written, warnings=[recovery_warning] if recovery_warning else [])
         # Readers hold the same lock while loading complete snapshots. Only
         # snapshots referenced by neither current nor previous catalog are pruned.
         retain={e['snapshot'] for e in entries}|{e['snapshot'] for e in current['folders']}
-        prune(root,retain)
-
-
-def prune(root,retain):
-    base=(Path(root)/'folders').resolve()
-    if not base.exists():return
-    for directory in base.iterdir():
-        if not directory.is_dir() or directory.is_symlink():continue
-        for revision in directory.iterdir():
-            if not revision.is_dir() or revision.is_symlink():continue
-            resolved=revision.resolve()
-            if not resolved.is_relative_to(base):continue
-            if revision.relative_to(Path(root).resolve()).as_posix() in retain:continue
+        if not recovery_warning:
             try:
-                for name in ['index.json','vectors.f32']:
-                    path=resolved/name
-                    if path.is_file():path.unlink()
-                resolved.rmdir()
-            except OSError:pass  # A held file/antivirus must not fail a good commit.
-        try:directory.rmdir()
-        except OSError:pass
+                prune(root,retain)
+            except OSError:
+                pass  # A verified, published index stays valid if cleanup must be retried.
+
+
+def plain(path):
+    return not path.is_symlink() and not path.is_junction()
+
+
+def prune(root, retain):
+    root = Path(root).resolve()
+    base = root / 'folders'
+    report = dict(removed=0, freed_bytes=0, failed=0)
+    if not plain(base) or not base.is_dir():
+        return report
+    for directory in base.iterdir():
+        if not re.fullmatch(r'[A-Za-z0-9_-]+-[0-9a-f]{12}', directory.name) or not plain(directory) or not directory.is_dir():
+            continue
+        for revision in directory.iterdir():
+            if (revision.relative_to(root).as_posix() in retain or not re.fullmatch(r'[0-9a-f]{24}', revision.name)
+                    or not plain(revision) or not revision.is_dir()):
+                continue
+            try:
+                files = list(revision.iterdir())
+                if any(p.name not in ('index.json', 'vectors.f32', 'search-vectors.f32') or not plain(p) or not p.is_file() for p in files):
+                    continue
+                for path in files:
+                    size = path.stat().st_size
+                    path.unlink()
+                    report['freed_bytes'] += size
+                revision.rmdir()
+                report['removed'] += 1
+            except OSError:
+                report['failed'] += 1
+    return report
+
+
+def cleanup(root):
+    """Validate both catalogs and their contents before removing anything."""
+    from .store import CorruptIndexError
+
+    root = Path(root).resolve()
+    with library_lock(root):
+        retain, verified = set(), set()
+        for name in ('catalog.json', 'catalog.json.bak'):
+            catalog_path = root / name
+            if not plain(catalog_path):
+                raise CorruptIndexError(f'Cleanup refused: linked catalog {name}')
+            if not catalog_path.exists():
+                if name == 'catalog.json':
+                    return dict(removed=0, freed_bytes=0, failed=0)
+                continue
+            catalog, _ = read_catalog(root, name)
+            for entry in catalog['folders']:
+                rel = entry['snapshot']
+                folder = snapshot_path(root, rel)
+                if folder != root / rel or any(not plain(p) for p in (folder, folder.parent, folder.parent.parent)):
+                    raise CorruptIndexError(f'Cleanup refused: linked snapshot {rel}')
+                files = [('index.json', 'index_sha256'), ('vectors.f32', 'vectors_sha256')]
+                if catalog.get('search_dim'):
+                    files.append(('search-vectors.f32', 'search_sha256'))
+                for filename, field in files:
+                    path = folder / filename
+                    expected = entry.get(field)
+                    if (path, expected) in verified:
+                        continue
+                    if not plain(path) or not path.is_file():
+                        raise CorruptIndexError(f'Cleanup refused: missing or linked {path}')
+                    with path.open('rb') as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                            raise CorruptIndexError(f'Cleanup refused: hash mismatch for {path}')
+                    verified.add((path, expected))
+                retain.add(rel)
+        return prune(root, retain)
 
 
 def migrate(data_dir):
@@ -261,11 +380,21 @@ def reset(index):
     root=index.data_dir
     with library_lock(root):
         path=root/'catalog.json'
-        if path.exists():_atomic_write(root/'catalog.json.bak',path.read_bytes())
+        old_raw = None
+        if path.exists():
+            try:
+                _, old_raw = read_catalog(root)
+            except Exception:
+                pass  # Do not replace valid recovery with a damaged active catalog.
         catalog=dict(format='folder-index-v1',version=2,model=None,api_type=None,dim=None,roots=[],
                      kinds_filter=None,created=None,updated=time.time(),count=0,folders=[])
         raw=encoded(catalog);_atomic_write(path,raw)
+        if old_raw is not None:
+            try:_atomic_write(root/'catalog.json.bak',old_raw)
+            except OSError:pass  # Keep existing recovery and all snapshot payloads.
         index.records=[];index.vectors=[];index.dim=None;index.model=None;index.api_type=None
+        index.search_dim = index._reduced_vectors = index._reduced_matrix = None
+        index.__dict__.pop('_folder_tree', None)
         index.roots=[];index.kind_filter=None;index._matrix=None;index._problem=None
         index._catalog=catalog;index._catalog_digest=digest(raw);index._folder_entries=[];index._partial=False
         index.created=None;index.updated=catalog['updated']

@@ -105,12 +105,14 @@ pub fn text(p: &Path) -> Res<String> {
         s
     })
 }
-pub fn chunks(s: &str) -> Vec<String> {
+pub fn chunks(s: &str) -> Res<Vec<String>> {
     let chars = s.chars().collect::<Vec<_>>();
     let mut out = vec![];
     let mut at = 0;
+    let mut covered = 0;
     while at < chars.len() && out.len() < 400 {
         let end = (at + 1600).min(chars.len());
+        covered = end;
         let v = chars[at..end].iter().collect::<String>();
         if !v.trim().is_empty() {
             out.push(v)
@@ -120,7 +122,10 @@ pub fn chunks(s: &str) -> Vec<String> {
         }
         at = end - 200;
     }
-    out
+    if chars[covered..].iter().any(|c| !c.is_whitespace()) {
+        return Err("Document exceeds 400 text chunks; split it into smaller files. Previous vectors were retained rather than replacing them with a partial index.".into());
+    }
+    Ok(out)
 }
 pub fn embed_file(
     api: &Api,
@@ -129,7 +134,7 @@ pub fn embed_file(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Res<Vec<(String, Vec<f64>)>> {
     if k == "image" {
-        return Ok(vec![(String::new(), api.image(p)?)]);
+        return Ok(vec![(String::new(), api.image_cancellable(p, cancel)?)]);
     }
     if k == "audio" || k == "video" {
         let b = fs::read(p).map_err(err)?;
@@ -146,11 +151,11 @@ pub fn embed_file(
         };
         return Ok(vec![(
             String::new(),
-            api.embed(vec![media(&mime, &b)])?.remove(0),
+            api.embed_cancellable(vec![media(&mime, &b)], cancel)?.remove(0),
         )]);
     }
     let s = text(p)?;
-    let parts = chunks(&s);
+    let parts = chunks(&s)?;
     if parts.is_empty() {
         return Err("No readable text (scanned PDFs need OCR)".into());
     }
@@ -160,11 +165,11 @@ pub fn embed_file(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("Indexing cancelled; previous file vectors retained".into());
         }
-        let vectors = api.embed(
+        let vectors = api.embed_cancellable(
             batch
                 .iter()
                 .map(|s| serde_json::json!(format!("title: {title} | text: {s}")))
-                .collect(),
+                .collect(), cancel,
         )?;
         for (s, v) in batch.iter().zip(vectors) {
             result.push((s.chars().take(500).collect(), v));

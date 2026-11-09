@@ -51,7 +51,7 @@ impl Opening {
                 let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
                 let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
                 let window = CreateWindowExW(
-                    WS_EX_DLGMODALFRAME, class, w!("Refseek · Opening…"),
+                    WS_EX_APPWINDOW | WS_EX_DLGMODALFRAME, class, w!("Opening Refseek Desktop…"),
                     WS_CAPTION | WS_POPUP, x, y, width, height,
                     None, None, Some(instance.into()), None,
                 )?;
@@ -59,7 +59,7 @@ impl Opening {
                 let children = (|| -> windows::core::Result<()> {
                     let label = CreateWindowExW(
                         WINDOW_EX_STYLE::default(), w!("STATIC"),
-                        w!("Opening Refseek…\nPreparing the desktop window. Please wait."),
+                        w!("Opening Refseek Desktop…\nPreparing the search window."),
                         WS_CHILD | WS_VISIBLE, 22, 18, 410, 48,
                         Some(window), None, Some(instance.into()), None,
                     )?;
@@ -82,6 +82,7 @@ impl Opening {
                     // The first ShowWindow can inherit a hidden launcher startup
                     // flag. The explicit second call also covers that launch path.
                     let _ = ShowWindow(window, SW_SHOW);
+                    let _ = SetForegroundWindow(window);
                     let _ = UpdateWindow(window);
                     let _ = tx.send(Ok(IsWindowVisible(window).as_bool()));
                     let mut msg = MSG::default();

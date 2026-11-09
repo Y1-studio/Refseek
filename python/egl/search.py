@@ -4,8 +4,9 @@ from pathlib import Path
 
 from .api import EmbedClient, l2norm, media_item
 from .config import Settings
+from .dimensions import prefix_vector
 from .store import Index
-from .textio import kind_of, mime_of, shrink_image
+from .textio import kind_of, mime_of, prepare_image
 
 
 class Searcher:
@@ -18,15 +19,16 @@ class Searcher:
 
     def query_vector(self, text=None, image_path=None, image_bytes=None, image_mime="image/png"):
         if image_bytes is not None:
-            raw = shrink_image(image_bytes, self.s.image_max)
-            vec = self.client.embed_one(media_item(raw, image_mime, "image"))
+            raw, mime = prepare_image(image_bytes, image_mime, self.s.image_max)
+            vec = self.client.embed_one(media_item(raw, mime, "image"))
         elif image_path:
             p = Path(image_path).expanduser()
             raw = p.read_bytes()
             kind = kind_of(p)
+            mime = mime_of(p, kind)
             if kind == "image":
-                raw = shrink_image(raw, self.s.image_max)
-            vec = self.client.embed_one(media_item(raw, mime_of(p, kind), kind))
+                raw, mime = prepare_image(raw, mime, self.s.image_max)
+            vec = self.client.embed_one(media_item(raw, mime, kind))
         elif text:
             vec = self.client.embed_query(text)
         else:
@@ -37,10 +39,12 @@ class Searcher:
                img_weight=0.5, neg_image_bytes=None, neg_image_mime="image/png",
                neg_image_weight=1.0, k=20, kind=None, index=None,
                exclude=None, neg_weight=1.0, wants=None, combine="avg", roots=None,
-               offset=0):
+               offset=0, scope=None, neg_image_vector=None):
         index = index or self.index(roots=roots)
         if not index.records:
             return []
+        def reduced(vector):
+            return prefix_vector(vector, index.search_dim) if index.search_dim else vector
         kinds = None
         if kind:
             kinds = [x.strip() for x in kind.split(",") if x.strip()]
@@ -53,7 +57,9 @@ class Searcher:
         if excludes:
             raw = self.client.embed([self.s.with_prefix_query(e) for e in excludes])
             negatives = [l2norm(v) for v in raw]
-        if neg_image_bytes is not None:
+        if neg_image_vector is not None:
+            neg_image_vecs = [neg_image_vector]
+        elif neg_image_bytes is not None:
             ivec = self.query_vector(image_bytes=neg_image_bytes, image_mime=neg_image_mime)
             neg_image_vecs = [ivec]
         else:
@@ -72,43 +78,43 @@ class Searcher:
                 tvec = self.query_vector(text=all_wants[0])
             else:
                 raw = self.client.embed([self.s.with_prefix_query(w) for w in all_wants])
-                vecs = [l2norm(v) for v in raw]
+                vecs = [reduced(l2norm(v)) for v in raw]
                 dim = len(vecs[0])
                 tvec = l2norm([sum(v[d] for v in vecs) / len(vecs) for d in range(dim)])
             ivec = self.query_vector(image_path=image_path, image_bytes=image_bytes,
                                      image_mime=image_mime)
-            fused = l2norm([a * alpha + t * (1.0 - alpha) for a, t in zip(ivec, tvec)])
+            fused = l2norm([a * alpha + t * (1.0 - alpha) for a, t in zip(reduced(ivec), reduced(tvec))])
             return index.search(fused, k=k, kinds=kinds, negatives=negatives,
                                 neg_weight=neg_weight, roots=roots, offset=offset,
-                                neg_images=neg_image_vecs, neg_image_weight=niw)
+                                neg_images=neg_image_vecs, neg_image_weight=niw, scope=scope)
         if want_image and (not all_wants or alpha >= 1.0):
             vec = self.query_vector(image_path=image_path, image_bytes=image_bytes,
                                     image_mime=image_mime)
             return index.search(vec, k=k, kinds=kinds, negatives=negatives, neg_weight=neg_weight,
                                 roots=roots, offset=offset,
-                                neg_images=neg_image_vecs, neg_image_weight=niw)
+                                neg_images=neg_image_vecs, neg_image_weight=niw, scope=scope)
         if not all_wants:
             raise ValueError("provide a text query or an image")
         if len(all_wants) == 1:
             vec = self.query_vector(text=all_wants[0])
             return index.search(vec, k=k, kinds=kinds, negatives=negatives, neg_weight=neg_weight,
                                 roots=roots, offset=offset,
-                                neg_images=neg_image_vecs, neg_image_weight=niw)
+                                neg_images=neg_image_vecs, neg_image_weight=niw, scope=scope)
         if combine not in ("avg", "max"):
             raise ValueError("combine must be 'avg' or 'max'")
         raw = self.client.embed([self.s.with_prefix_query(w) for w in all_wants])
-        vecs = [l2norm(v) for v in raw]
+        vecs = [reduced(l2norm(v)) for v in raw]
         if combine == "avg":
             dim = len(vecs[0])
             mean = [sum(v[d] for v in vecs) / len(vecs) for d in range(dim)]
             return index.search(mean, k=k, kinds=kinds, negatives=negatives, neg_weight=neg_weight,
                                 roots=roots, offset=offset,
-                                neg_images=neg_image_vecs, neg_image_weight=niw)
+                                neg_images=neg_image_vecs, neg_image_weight=niw, scope=scope)
         best: dict[tuple, dict] = {}
         for v in vecs:
             for hit in index.search(v, k=k + offset, kinds=kinds, negatives=negatives,
                                     neg_weight=neg_weight, roots=roots,
-                                    neg_images=neg_image_vecs, neg_image_weight=niw):
+                                    neg_images=neg_image_vecs, neg_image_weight=niw, scope=scope):
                 key = (hit.get("path"), hit.get("chunk", 0))
                 if key not in best or hit["score"] > best[key]["score"]:
                     best[key] = hit

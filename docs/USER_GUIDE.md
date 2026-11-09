@@ -20,7 +20,7 @@ The left menu has **Search**, **Library**, and **Settings**.
 
 1. Click **Library**, then **Browse…**.
 2. Choose a folder of pictures. Refseek also looks inside its subfolders.
-3. Leave **image** checked. Uncheck other file types if you only want pictures.
+3. Leave **image** checked for pictures. Images are selected by default; any file-type changes are remembered.
 4. Click **Add & index**.
 
 Indexing creates the information Refseek needs to search each file. Start with a small folder you know well so you can judge the results before preparing a larger collection.
@@ -102,9 +102,13 @@ Enter unwanted concepts, one per line, such as `text` or `watermark`. **Text exc
 
 ### File types and folders
 
-Leave **image** checked for picture results. The folder checkboxes set the search area: no folders checked searches the whole library; checked folders restrict it to those locations.
+Leave **image** checked for picture results. Under **Folders and subfolders**, use **Include** to search a folder and **Skip** to leave it out. With no Include selections, Refseek searches the whole library except skipped folders.
 
-A label such as `H:\draw` is a folder's address on your computer. Select its checkbox instead of typing the address.
+The folder list starts with the indexed roots. Click **+** beside a folder to see its subfolders, or **Collapse all** to return to the root list. A rule applies to its descendants even when the branch is closed. For example, include `References`, skip `References\Photos`, then include `References\Photos\Poses` to put that last folder back in the search. Click **Clear folder filters** to return to the whole library.
+
+Open a result's image preview and choose **Search this folder only** to repeat your search in the picture's immediate folder. Subfolders are excluded. **Search all folders** beside the main search button clears the folder filters and runs your search across the library again.
+
+These controls filter saved results. They don't remove files from the index or change what gets indexed. A label such as `H:\draw` is a folder's address on your computer; select its checkbox instead of typing the address.
 
 ## Browse pictures
 
@@ -125,6 +129,8 @@ After adding, editing or deleting pictures, open **Library** and click **Update 
 **Open folder** opens the source folder in Windows. **Remove from library** removes it from the catalogue and leaves its original files on your drive.
 
 Keep external drives connected when searching their pictures. If you move or rename a source folder, add and index the new location, then remove the old library entry.
+
+You can keep a picture collection in its own folder beside the EXE. Refseek includes that collection's subfolders. Its private `data` folder and active index cache remain excluded.
 
 ## Change display settings
 
@@ -148,11 +154,41 @@ Scroll down if larger controls extend below the window. **Reset appearance & lay
 
 Keyboard shortcuts: **Ctrl + +** increases UI scale, **Ctrl + -** decreases it, **Ctrl + 0** restores normal scale, and **Ctrl + Enter** runs a search.
 
+**Settings > Local model > Image preparation workers** defaults to **2**. Enter a whole number up to the available CPU threads or choose Auto, which uses up to four workers. Refseek remembers the choice and applies changes to the next indexing job. More workers can help with large images, but use more memory and do not guarantee faster model inference.
+
 Under **Local model**, start with **Backend for the next launch: Auto**. It tries a compatible NVIDIA graphics card through CUDA, then a graphics device through Vulkan, then the main processor through CPU. A manual backend change takes effect after closing and reopening Refseek.
+
+## Choose index dimensions
+
+Under **Settings > Local model > Index dimensions**, choose 768, 512, 256, or 128 before indexing an empty library. New libraries default to **768**. Smaller vectors keep the leading values from the model output and normalize them again.
+
+An existing library keeps the dimension detected in its saved index, including older 768-dimensional libraries. The selector is locked after files have been indexed to avoid mixing incompatible vectors. Use a new application/library folder to start with a different dimension; don't delete a working index to change this setting.
+
+Settings shows estimated vector storage for 10,000 files, assuming one vector per file. The totals are 35.84 MB at 128, 40.96 MB at 256, 51.20 MB at 512, and 30.72 MB at 768. Smaller dimensions keep a separate full cache for trained Style. At 768, search and Style share one copy. These estimates exclude metadata and earlier snapshots; documents can have more than one vector per file.
+
+Library estimates vector storage during indexing. After a folder is saved, **Saved index** shows its active snapshot size, including metadata and any style cache. **Indexed originals** shows the total size of the indexed source files recorded at the last scan. Refseek does not copy those originals into the index. Earlier snapshots and model files are separate from the displayed index size.
+
+Text and exclusions use the selected index dimension. Smaller dimensions don't skip the model's image-processing work. The 128 option reduces image-search quality; 768 is the default for artwork.
+
+### Remove old checkpoints
+
+After a changed index is saved, Refseek keeps the active catalog and one recovery catalog. It removes older snapshots that neither catalog uses. An unchanged rescan keeps the existing recovery copy.
+
+If you upgraded from an older build, open **Library > Clean up old snapshots** to clear leftovers without reindexing. Refseek verifies both catalogs before cleanup and leaves original pictures, model files and unrelated files alone. The result appears next to the cleanup button and stays visible after you reopen Refseek.
+
+Cleanup stops before deleting files if either protected index has unreadable JSON, invalid vectors, or a failed checksum. If startup fails, keep the data folder intact. `data/startup-error.json` records the error and, for a library-loading failure, checks whether the previous catalog is usable. This check does not activate the recovery copy. You can also close Refseek and run `Refseek-Desktop.exe --check-library`; its result is saved to `library-check.json` beside the app.
+
+[Google's model guide](https://huggingface.co/google/embeddinggemma-2#3-matryoshka-dimension-truncation) describes the supported dimensions and normalization.
+
+## Check GPU indexing
+
+The Library progress display identifies the embedding backend and device. **CUDA** uses an NVIDIA GPU; **Vulkan** uses a graphics device; **CPU** uses the main processor. Scanning folders, reading files and preparing images still use the CPU, including when embeddings run on a GPU.
+
+Auto waits for GPU initialization before trying the next backend. A first launch can take longer while graphics kernels are prepared. If it falls back to CPU, the displayed backend says so. `data/backend-attempts.json` and `data/logs/` record detection and startup failures. Keep these files with an error report.
 
 ## Keep your library during updates
 
-The `data` folder beside the application holds settings, the search catalogue and working resources. Keep it. To move or back up Refseek, copy the whole application folder, including `data`. Your source picture folders also need to remain available.
+The `data` folder beside the application holds settings and working resources; `data/library` holds the desktop search catalogue. Keep it. To move or back up Refseek, copy the whole application folder, including `data`. Your source picture folders also need to remain available.
 
 To update, close the app, replace the EXE in the same folder, keep `data`, and open the new EXE. If its name changed, update your shortcuts too.
 
@@ -166,7 +202,7 @@ Close normally with the X at the top right. Allow ongoing work time to finish cl
 
 **New pictures are missing:** use **Update this folder**, then search again. During indexing, newly prepared files appear after the next saved batch.
 
-**A picture won't load:** supported image inputs include JPG/JPEG, PNG, WebP, GIF, BMP and TIFF. Export layered Photoshop or Clip Studio artwork to PNG or JPEG for indexing. Incomplete or damaged files can still fail. **Open latest indexing details** in Library shows skipped-file information.
+**A picture won't load:** supported image inputs include JPG/JPEG, PNG, WebP, GIF, BMP and TIFF. Export layered Photoshop or Clip Studio artwork to PNG or JPEG for indexing. Incomplete or damaged files can still fail. Select **Show latest indexing details** in Library, then expand **Warnings** to see why files were skipped.
 
 **The library is already open:** use the existing app window, or close it before opening another instance with the same library.
 
@@ -175,3 +211,9 @@ Close normally with the X at the top right. Allow ongoing work time to finish cl
 For an error report, include the exact message or a screenshot, what you clicked, and the image or folder involved.
 
 [Back to the overview](../README.md) · [Build instructions](NATIVE_BUILDING.md)
+
+## Faster updates and content verification
+
+**Update this folder** compares files with their saved paths, sizes and modification times. Matching files skip reading, resizing and embedding, while the directory scan discovers new files and removals. A completely unchanged update does not save another snapshot.
+
+Use **Verify file contents** for edits that may have kept the same file size and modification time. This reads and hashes files, so it is slower. A failed or cancelled changed file keeps its previous saved vectors until a complete replacement is ready. Read **Show latest indexing details** for warnings and skipped files.

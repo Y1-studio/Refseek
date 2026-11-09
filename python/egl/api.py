@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import threading
+from contextlib import contextmanager
 import time
 import urllib.error
 import urllib.request
@@ -13,9 +16,14 @@ class ApiError(RuntimeError):
     pass
 
 
+class IndexCancelled(ApiError):
+    pass
+
+
 class EmbedClient:
     def __init__(self, settings: Settings):
         self.s = settings
+        self._cancel_state = threading.local()
         self.api_type = settings.api_type
         self.api_url = settings.api_url
         if self.api_url == "auto":
@@ -30,6 +38,20 @@ class EmbedClient:
             return self.api_url.replace("/v1", "").replace("/api", "").rstrip("/")
         return self.api_url
 
+    @contextmanager
+    def cancel_scope(self, callback):
+        previous = getattr(self._cancel_state, 'callback', None)
+        self._cancel_state.callback = callback
+        try:
+            yield
+        finally:
+            self._cancel_state.callback = previous
+
+    def _check_cancel(self):
+        callback = getattr(getattr(self, '_cancel_state', None), 'callback', None)
+        if callback and callback():
+            raise IndexCancelled('Indexing cancelled; previous file vectors retained')
+
     def _request(self, method: str, url: str, payload=None, timeout=None):
         headers = {"Content-Type": "application/json"}
         if self.api_type != "ollama" and self.s.api_key:
@@ -38,9 +60,15 @@ class EmbedClient:
         last = None
         for attempt in range(3):
             try:
+                self._check_cancel()
+                if getattr(getattr(self, '_cancel_state', None), 'callback', None):
+                    from .cancellable_http import request
+                    return request(method, url, data, headers, timeout or self.s.timeout, self._check_cancel)
                 req = urllib.request.Request(url, data=data, headers=headers, method=method)
                 with urllib.request.urlopen(req, timeout=timeout or self.s.timeout) as resp:
                     return json.loads(resp.read().decode("utf-8"))
+            except IndexCancelled:
+                raise
             except urllib.error.HTTPError as e:
                 body = ""
                 try:
@@ -57,7 +85,10 @@ class EmbedClient:
                     raise last
             except Exception as e:
                 last = ApiError(f"{method} {url} -> {e}")
-            time.sleep(1.5 * (attempt + 1))
+            until = time.monotonic() + 1.5 * (attempt + 1)
+            while time.monotonic() < until:
+                self._check_cancel()
+                time.sleep(min(.1, max(0, until - time.monotonic())))
         raise last
 
     def get(self, path: str):
@@ -132,10 +163,21 @@ class EmbedClient:
                     payload["dimensions"] = s.dim
                 data = self._request("POST", self.base + "/embeddings", payload)
                 rows = data.get("data") or []
-                rows = sorted(rows, key=lambda r: r.get("index", 0))
+                if (len(rows) != len(part) or any(not isinstance(r, dict) or type(r.get('index')) is not int for r in rows)
+                    or sorted(r['index'] for r in rows) != list(range(len(part)))):
+                    raise ApiError('Embedding response has missing, duplicate or invalid row indices')
+                rows = sorted(rows, key=lambda r: r['index'])
                 vecs = [r.get("embedding") for r in rows]
             if len(vecs) != len(part):
                 raise ApiError(f"embeddings returned {len(vecs)} vectors for {len(part)} inputs")
+            for vector in vecs:
+                if not isinstance(vector, (list, tuple)) or not vector or any(
+                    isinstance(x, bool) or not isinstance(x, (float, int)) or not math.isfinite(x) for x in vector
+                ):
+                    raise ApiError('Embedding API returned an invalid vector')
+                norm = math.hypot(*vector)
+                if not math.isfinite(norm) or norm <= 1e-12:
+                    raise ApiError('Embedding API returned a zero or invalid vector')
             out.extend(vecs)
         return out
 

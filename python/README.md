@@ -1,4 +1,4 @@
-# Refseek Browser source
+# Refseek Browser 2.2.0 source
 
 This folder contains the Python edition. Its launcher starts the bundled model server and opens a local page in the default browser. Closing the launcher with **Stop and exit** saves completed indexing work and stops its model process.
 
@@ -44,3 +44,7 @@ This checks model startup and text/image embedding compatibility, then writes `d
 [Runtime flags and model notes](README.txt) · [Third-party notices](../THIRD_PARTY_NOTICES.md)
 
 No project-wide source license has been selected.
+
+## Indexing in 2.2
+
+The owner can set **CPU preparation workers** in Settings. The default is two, with a saved custom value up to the available CPU threads. Indexing starts with images selected and remembers file-type choices. A bounded pipeline overlaps preparation and two independent embedding requests. Normal updates skip unchanged file content; **Verify file contents** adds hashing. Read the [release notes](../docs/RELEASE_NOTES.md) for cancellation, recovery and document-limit fixes.

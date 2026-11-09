@@ -1,6 +1,6 @@
 [package]
 name = "semantic-search-native"
-version = "2.0.1"
+version = "2.2.0"
 edition = "2024"
 rust-version = "1.92"
 
